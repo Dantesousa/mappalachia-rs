@@ -413,7 +413,8 @@ fn all_params(term: &str) -> SearchParams {
 fn search_nuka_cola() {
     let Some(c) = conn() else { return };
     let r = search(&c, &all_params("Nuka Cola")).unwrap();
-    assert_eq!(r.len(), 586); // standard rows for "Nuka%Cola", all spaces
+    // Verbatim C# semantics: 339 standard + 8 container groups + 1 location = 348.
+    assert_eq!(r.len(), 348);
 }
 #[test]
 fn search_scrap_steel() {
@@ -434,7 +435,7 @@ fn search_flux_crimson() {
     let Some(c) = conn() else { return };
     let r = search(&c, &all_params("Crimson")).unwrap();
     let total: i64 = r.iter().filter(|x| matches!(x.entity_kind(), EntityKind::DerivedFlux(_))).map(|x| x.count()).sum();
-    assert_eq!(total, 6497);
+    assert_eq!(total, 5677); // nukable (Appalachia-only) filter applied, per C# line 227
 }
 #[test]
 fn search_form_id_instance() {
@@ -452,7 +453,7 @@ fn search_region_and_location() {
 }
 ```
 
-Expected counts measured 2026-10-11 against release DB (game 1.7.26.13): standard rows 586, scrap Steel 21795, NPC Scorched 1731, flux Crimson 6497.
+Expected counts measured 2026-10-11 against release DB (game 1.7.26.13) under verbatim C# semantics: Nuka Cola 348 (339 standard + 8 container + 1 location), scrap Steel 21795, NPC Scorched 1731, flux Crimson 5677 (nukable-only).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
