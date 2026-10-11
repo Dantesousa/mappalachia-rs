@@ -18,9 +18,9 @@ fn meta_and_spaces() {
     assert_eq!(spaces.len(), 205);
     let app = spaces
         .iter()
-        .find(|s| s.entity.editor_id == "APPALACHIA")
+        .find(|s| s.editor_id() == "APPALACHIA")
         .unwrap();
-    assert_eq!(app.entity.form_id, 2480661);
+    assert_eq!(app.form_id(), 2480661);
 }
 
 #[test]

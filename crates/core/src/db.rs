@@ -27,8 +27,8 @@ pub fn game_version(c: &Connection) -> Result<String> {
     )
 }
 
-/// Mirrors C# `CommonDatabase.GetAllSpaces`
-/// (`SELECT * FROM Space ORDER BY isWorldspace DESC, spaceEditorID ASC`),
+/// Mirrors C# `Database.Initialize`
+/// (`SELECT * FROM Space ORDER BY isWorldspace DESC, spaceDisplayName ASC`),
 /// returning fully-populated [`Space`] values (cf. C# `PopulateFromData`).
 pub fn all_spaces(c: &Connection) -> Result<Vec<Space>> {
     let mut s = c.prepare(
