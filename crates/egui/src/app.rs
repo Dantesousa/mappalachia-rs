@@ -56,8 +56,10 @@ pub struct App {
     pub next_group: usize,
     /// Map background (`MapSettings.BackgroundImage`; C# default `Menu`).
     pub background: BackgroundImageType,
-    /// Map brightness (`MapSettings.Brightness`; C# default 0.5, setter
-    /// clamps to 0.1–2.0).
+    /// Map brightness (`MapSettings.Brightness`; setter clamps to
+    /// 0.1–2.0). Deliberate product deviation: fresh UI state starts at
+    /// full brightness `1.0`, not the C# default `0.5` (see
+    /// `render::settings::default_brightness`).
     pub brightness: f32,
     /// Map title (`MapSettings.Title`; C# default `""`).
     pub title: String,
@@ -91,6 +93,11 @@ pub struct App {
     pub preview: PreviewState,
     /// Live channel while `preview == Rendering`; `None` otherwise.
     preview_rx: Option<std::sync::mpsc::Receiver<PreviewResult>>,
+    /// Pan/zoom view into the preview texture, owned by the central
+    /// `egui::Scene`. `Rect::ZERO` means "fit to panel" (Scene auto-fits
+    /// an invalid rect); the Reset-view button restores it. Never touches
+    /// the Render/texture flow — it only re-frames the uploaded texture.
+    pub scene_rect: egui::Rect,
 }
 
 /// Preview lifecycle: idle, worker running, uploaded texture, or worker
@@ -169,7 +176,9 @@ impl App {
             items: Vec::new(),
             next_group: 0,
             background: BackgroundImageType::Menu,
-            brightness: 0.5,
+            // Deliberate product deviation from the C# 0.5 default (see
+            // `render::settings::default_brightness`).
+            brightness: 1.0,
             title: String::new(),
             filename,
             legend_style: LegendStyle::Compact,
@@ -183,6 +192,7 @@ impl App {
             plot_mode: PlotMode::Standard,
             preview: PreviewState::Idle,
             preview_rx: None,
+            scene_rect: egui::Rect::ZERO,
         }
     }
 
@@ -1072,9 +1082,23 @@ impl eframe::App for App {
                     ui.label("Rendering...");
                 }
                 PreviewState::Ready(tex) => {
-                    ui.label("Preview ready.");
-                    let avail = ui.available_size();
-                    ui.add(egui::Image::new(tex).fit_to_exact_size(avail));
+                    ui.horizontal(|ui| {
+                        ui.label("Preview ready. Drag to pan, scroll to zoom.");
+                        // Restores the fit-to-panel view: Scene auto-fits an
+                        // invalid rect, so resetting to ZERO re-fits. This
+                        // only re-frames the uploaded texture; the
+                        // Render-button/texture flow is untouched.
+                        if ui.button("Reset view").clicked() {
+                            self.scene_rect = egui::Rect::ZERO;
+                        }
+                    });
+                    let native = tex.size_vec2();
+                    egui::Scene::new()
+                        .zoom_range(egui::Rangef::new(0.0, 8.0))
+                        .max_inner_size(native + egui::Vec2::splat(32.0))
+                        .show(ui, &mut self.scene_rect, |ui| {
+                            ui.add(egui::Image::new(tex).fit_to_exact_size(native));
+                        });
                 }
                 PreviewState::Failed(e) => {
                     ui.label(format!("Preview failed: {e}"));
@@ -1273,7 +1297,9 @@ mod tests {
     fn settings_defaults_match_csharp() {
         let app = settings_app();
         assert_eq!(app.background, BackgroundImageType::Menu);
-        assert_eq!(app.brightness, 0.5);
+        // Deliberate product deviation from the C# 0.5 (see
+        // `render::settings::default_brightness`).
+        assert_eq!(app.brightness, 1.0);
         assert!(app.title.is_empty());
         assert_eq!(app.legend_style, LegendStyle::Compact);
         assert_eq!(app.legend_halign, LegendHorizontalAlignment::Right);
@@ -1285,6 +1311,17 @@ mod tests {
         assert_eq!(app.plot_style.size, 50);
         assert_eq!(app.plot_style.palette.len(), 8);
         assert_eq!(app.plot_mode, PlotMode::Standard);
+    }
+
+    #[test]
+    fn default_brightness_is_full_and_scene_starts_fit_to_panel() {
+        // Deliberate product deviation from the C# 0.5 default: fresh UI
+        // state renders at full brightness.
+        let app = settings_app();
+        assert_eq!(app.brightness, 1.0);
+        // The preview Scene starts fit-to-panel (`Rect::ZERO` auto-fits);
+        // the Reset-view button restores exactly this value.
+        assert_eq!(app.scene_rect, egui::Rect::ZERO);
     }
 
     #[test]
