@@ -939,6 +939,10 @@ impl App {
         self.preview = PreviewState::Idle;
         self.preview_bytes = None;
         self.dirty = true;
+        // Drop the map-window copy too so a stale 67MB GPU texture
+        // does not linger after invalidation (it re-uploads on reopen).
+        self.map_window_tex = None;
+        self.map_window_gen = 0;
     }
 
     /// Retain a finished render's bytes and bump the generation counter.
