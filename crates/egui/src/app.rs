@@ -812,6 +812,25 @@ impl App {
 }
 
 /// Preview invalidation + settings fingerprint (stale-preview fixes).
+/// Snapshot of every panel field that feeds [`App::draw_settings`].
+/// A struct (not a tuple: tuples stop implementing traits past 12 fields).
+#[derive(Debug, Clone, PartialEq)]
+struct SettingsFingerprint {
+    space_idx: usize,
+    background: BackgroundImageType,
+    brightness: f32,
+    title: String,
+    legend_style: LegendStyle,
+    legend_halign: LegendHorizontalAlignment,
+    legend_valign: LegendVerticalAlignment,
+    compass: CompassStyle,
+    show_grid: bool,
+    show_markers: bool,
+    show_infestations: bool,
+    plot_mode: PlotMode,
+    plot_style: PlotStyleSettings,
+}
+
 impl App {
     /// Drop any rendered/stale preview: the panel must never show a map
     /// that no longer matches state. Called after every mutation that
@@ -843,38 +862,22 @@ impl App {
     /// The settings widgets write these fields directly (no setters to
     /// hook), so `update` compares this across the panels and drops a
     /// preview made stale by any settings edit.
-    fn settings_fingerprint(
-        &self,
-    ) -> (
-        usize,
-        BackgroundImageType,
-        f32,
-        String,
-        LegendStyle,
-        LegendHorizontalAlignment,
-        LegendVerticalAlignment,
-        CompassStyle,
-        bool,
-        bool,
-        bool,
-        PlotMode,
-        PlotStyleSettings,
-    ) {
-        (
-            self.space_idx,
-            self.background,
-            self.brightness,
-            self.title.clone(),
-            self.legend_style,
-            self.legend_halign,
-            self.legend_valign,
-            self.compass,
-            self.show_grid,
-            self.show_markers,
-            self.show_infestations,
-            self.plot_mode,
-            self.plot_style.clone(),
-        )
+    fn settings_fingerprint(&self) -> SettingsFingerprint {
+        SettingsFingerprint {
+            space_idx: self.space_idx,
+            background: self.background,
+            brightness: self.brightness,
+            title: self.title.clone(),
+            legend_style: self.legend_style,
+            legend_halign: self.legend_halign,
+            legend_valign: self.legend_valign,
+            compass: self.compass,
+            show_grid: self.show_grid,
+            show_markers: self.show_markers,
+            show_infestations: self.show_infestations,
+            plot_mode: self.plot_mode,
+            plot_style: self.plot_style.clone(),
+        }
     }
 }
 
