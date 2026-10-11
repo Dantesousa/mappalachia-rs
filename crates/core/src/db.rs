@@ -53,9 +53,8 @@ pub fn all_spaces(c: &Connection) -> Result<Vec<Space>> {
 /// Mirrors C# `Database.GetMapMarkersForSpace`
 /// (`SELECT * FROM MapMarker WHERE SpaceFormID = … ORDER BY Y`).
 pub fn map_markers_for_space(c: &Connection, space_form_id: u32) -> Result<Vec<MapMarker>> {
-    let mut s = c.prepare(
-        "SELECT x, y, label, icon FROM MapMarker WHERE spaceFormID = ? ORDER BY y",
-    )?;
+    let mut s =
+        c.prepare("SELECT x, y, label, icon FROM MapMarker WHERE spaceFormID = ? ORDER BY y")?;
     let rows = s.query_map([space_form_id], |r| {
         Ok(MapMarker::new(
             r.get::<_, String>(3)?,
@@ -76,6 +75,18 @@ fn global(c: &Connection, key: &str) -> Result<f64> {
 /// Mirrors C# `Database.GetBlastRadius` (`EN07_NukeBlastRadius`).
 pub fn blast_radius(c: &Connection) -> Result<f64> {
     global(c, "EN07_NukeBlastRadius")
+}
+
+/// Mirrors C# `Database.PopulateFromData` (`Database.cs:858-861`): resolve
+/// a (typically recipe-deserialized, `max_range == 0`) space against the
+/// database, matching by entity equality (`form_id + editor_id`), and error
+/// (`QueryReturnedNoRows`) when no row matches — mirroring the C# throw.
+pub fn populate_from_data(conn: &Connection, space: &Space) -> Result<Space> {
+    let spaces = all_spaces(conn)?;
+    spaces
+        .into_iter()
+        .find(|s| *s == *space)
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
 /// Mirrors C# `Database.GetInfestationRadius`

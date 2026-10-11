@@ -137,9 +137,13 @@ fn load_region_points(conn: &Connection, region: &mut Region, space: &Space) -> 
     Ok(())
 }
 
-/// Mirrors C# `GetRegion(editorID, space)`: the region's instance at the
-/// first subregion's centroid, or `None` when the region row is missing.
-fn region_instance(conn: &Connection, editor_id: &str, space: &Space) -> Result<Option<Instance>> {
+/// Mirrors the region-row lookup inside C# `GetRegion(editorID, space)`:
+/// the fully-populated [`Region`] (points, levels), or `None` when the
+/// region row is missing. The draw pipeline uses this to paint region
+/// polygons (the [`Instance`] returned by [`instances`] carries only the
+/// centroid, since the flat model cannot nest the region inside the entity
+/// the way the C# object graph does).
+pub fn load_region(conn: &Connection, editor_id: &str, space: &Space) -> Result<Option<Region>> {
     let query = format!(
         "SELECT minLevel, maxLevel, regionFormID FROM Region WHERE regionEditorID = '{}' AND spaceFormID = {}",
         esc(editor_id),
@@ -162,6 +166,46 @@ fn region_instance(conn: &Connection, editor_id: &str, space: &Space) -> Result<
     };
     let mut region = Region::new(region_id, editor_id, space.clone(), min_level, max_level);
     load_region_points(conn, &mut region, space)?;
+    Ok(Some(region))
+}
+
+/// Mirrors the location-plus-cells lookup inside C# `GetLocationInstance`:
+/// the [`Location`] with all its cells populated. The draw pipeline uses
+/// this to paint location cell volumes.
+pub fn load_location(
+    conn: &Connection,
+    form_id: u32,
+    editor_id: &str,
+    display_name: &str,
+    space: &Space,
+) -> Result<Location> {
+    let query = format!(
+        "SELECT x, y FROM Cell WHERE locationFormId = '{}' AND spaceFormID = {}",
+        form_id,
+        space.form_id(),
+    );
+    let mut s = conn.prepare(&query)?;
+    let rows = s.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>("x")? as i32,
+            row.get::<_, i64>("y")? as i32,
+        ))
+    })?;
+    let mut location = Location::new(form_id, editor_id, display_name, space.clone());
+    for r in rows {
+        let (x, y) = r?;
+        let cell = Cell::new(location.entity.clone(), space.clone(), x, y);
+        location.add_cell(cell);
+    }
+    Ok(location)
+}
+
+/// Mirrors C# `GetRegion(editorID, space)`: the region's instance at the
+/// first subregion's centroid, or `None` when the region row is missing.
+fn region_instance(conn: &Connection, editor_id: &str, space: &Space) -> Result<Option<Instance>> {
+    let Some(region) = load_region(conn, editor_id, space)? else {
+        return Ok(None);
+    };
     // Mirrors `region.GetAllSubRegions().First().GetCentroid()`.
     let first = region
         .all_sub_regions()
@@ -286,29 +330,13 @@ fn location_instances(
     result: &crate::search::Grouped,
     space: &Space,
 ) -> Result<Vec<Instance>> {
-    let query = format!(
-        "SELECT x, y FROM Cell WHERE locationFormId = '{}' AND spaceFormID = {}",
+    let location = load_location(
+        conn,
         result.entity.form_id,
-        space.form_id(),
-    );
-    let mut s = conn.prepare(&query)?;
-    let rows = s.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>("x")? as i32,
-            row.get::<_, i64>("y")? as i32,
-        ))
-    })?;
-    let mut location = Location::new(
-        result.entity.form_id,
-        result.entity.editor_id.clone(),
-        result.entity.display_name.clone(),
-        space.clone(),
-    );
-    for r in rows {
-        let (x, y) = r?;
-        let cell = Cell::new(location.entity.clone(), space.clone(), x, y);
-        location.add_cell(cell);
-    }
+        &result.entity.editor_id.clone(),
+        &result.entity.display_name.clone(),
+        space,
+    )?;
     let coords: Vec<Coord> = location.cells.iter().map(|c| c.coord()).collect();
     let center = if coords.is_empty() {
         Coord::new(0.0, 0.0)

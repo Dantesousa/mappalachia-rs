@@ -1,0 +1,32 @@
+{
+  "Space": {
+    "FormID": 2480661,
+    "EditorID": "APPALACHIA"
+  },
+  "MapSettings": {
+    "Title": "Nuka-Cola Appalachia",
+    "Brightness": 1.0,
+    "BackgroundImage": "Render",
+    "LegendStyle": "Compact"
+  },
+  "PlotSettings": {
+    "Mode": "Standard"
+  },
+  "ItemsToPlot": [
+    {
+      "Entity": {
+        "FormID": 295773,
+        "EditorID": "NukaCola"
+      },
+      "Space": {
+        "FormID": 2480661,
+        "EditorID": "APPALACHIA"
+      },
+      "Count": 15,
+      "SpawnWeight": 1.0,
+      "Label": "",
+      "LockLevel": 0,
+      "InContainer": false
+    }
+  ]
+}

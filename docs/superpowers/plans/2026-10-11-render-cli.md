@@ -12,7 +12,7 @@
 
 - Workspace root `/home/dante/Documents/mappalachia-rs/`, resolver 2, edition 2021.
 - Asset root env `MAPPALACHIA_ASSETS` = `/mnt/hd/mappalachia` (full release extract: `img/{wrld,cell,mapmarker,icon}`, `font/`, `data/`). Tests skip with message when unset/missing. Never write into it.
-- Test DB env `MAPPALACHIA_DB` (same skip pattern as core).
+- Test DB env `MAPPALACHIA_DB` (same skip pattern as core). MUST be the 2.0.5.2 DB at `/home/dante/Documents/mappalachia-data/data/mappalachia.db` (game 1.7.26.13, 205 spaces) — the DB under `/mnt/hd/mappalachia/data/` is an older release (1.7.25.39, 204 spaces) and breaks parity counts. `/mnt/hd/mappalachia` remains valid for `MAPPALACHIA_ASSETS` only.
 - Canvas is always 4096×4096 (`MAP_IMAGE_RESOLUTION`); Extended legend widens to 4096+585.
 - Draw order follows `Map.Draw` (`~/Documents/Mappalachia/Mappalachia/Map.cs` lines 122-209) exactly.
 - Same-value constants from `Map.cs` lines 53-100 (listed per task).
@@ -166,6 +166,7 @@ impl View {
                factor: space.max_range / mappalachia_core::common::MAP_IMAGE_RESOLUTION as f64 }
     }
 }
+```
 
 /// Mirrors AsImagePoint: x = (wx-cx)/f + 2048; y = ((-wy+cy)/f) + 2048 (Y flip).
 
@@ -320,7 +321,9 @@ empty 4096 canvas (transparent, mirrors new Bitmap)
 → coord grid (Fine 40/Medium 20/Large 10 intervals; minor/major pens; edge labels; x-labels -90°)
 → infestations (fill (32,255,120,100) + edge (128,255,120,100) w4 + infestation SVG centered; centroid +(2048,-2048) per Map.cs:224)
 → map markers (icons at 1.5×, optional grayscale; labels below, shadowed iff no icons)
+NOTE: door + infestation SVGs are scale-1 in C# (Map.cs:804 default DoorIconScale=1; GetInfestationMarker scale=1) but `svg_marker` bakes 1.5× — downscale to 2/3 when drawing these two so output matches.
 → standard plots (items sorted by legend_group; skip other spaces; region/location/shape/icon branches; VolumeDrawMode Fill/Border/Both; region levels ≤/≥/range strings)
+NOTE: strokes use miter_limit 10.0 (GDI+ Pen default; tiny-skia Stroke::default is 4.0) so acute polygon joins match.
 → watermark (space name + instanced + grid range/center + game version + credit; transparent white, bottom, grid margin)
 → title (top, margin when grid)
 → legend (skip Hidden/empty; distinct (group,text); Extended widens +585; rows icon+colored text; (continued) overflow)

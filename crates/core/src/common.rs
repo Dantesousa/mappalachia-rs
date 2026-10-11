@@ -9,13 +9,19 @@ pub const CELL_SIZE: i32 = 4096;
 
 /// Mirrors Common.FormID regex `^(0[Xx])?([0-9A-Fa-f]{1,8})$`.
 pub fn is_hex_form_id(s: &str) -> bool {
-    let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let h = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     !h.is_empty() && h.len() <= 8 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Mirrors Common.HexToInt: parses optional-0x hex, panics on invalid like Convert.ToUInt32.
 pub fn hex_to_int(hex: &str) -> u32 {
-    let h = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(hex);
+    let h = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
     u32::from_str_radix(h, 16).expect("invalid hex FormID")
 }
 

@@ -2,7 +2,7 @@ use mappalachia_core::db;
 use mappalachia_core::{
     enums::{LockLevel, Signature},
     model::EntityKind,
-    search::{SearchParams, SearchResult, search},
+    search::{search, SearchParams, SearchResult},
 };
 
 fn conn() -> Option<rusqlite::Connection> {
@@ -100,10 +100,9 @@ fn search_flux_crimson() {
 fn search_form_id_instance() {
     let Some(c) = conn() else { return };
     let r = search(&c, &all_params("00094FC1")).unwrap(); // = entity 610241, advanced on
-    assert!(
-        r.iter()
-            .any(|x| matches!(x, SearchResult::Singular { .. }) || x.form_id() == 610241)
-    );
+    assert!(r
+        .iter()
+        .any(|x| matches!(x, SearchResult::Singular { .. }) || x.form_id() == 610241));
 }
 #[test]
 fn search_region_and_location() {
@@ -111,17 +110,20 @@ fn search_region_and_location() {
     let r = search(&c, &all_params("Nuke")).unwrap();
     assert!(r.iter().any(|x| x.editor_id() == "NukeRegionA"));
     let r = search(&c, &all_params("Flatwoods")).unwrap();
-    assert!(
-        r.iter()
-            .any(|x| x.editor_id() == "LocForestFlatwoodsLocation")
-    );
+    assert!(r
+        .iter()
+        .any(|x| x.editor_id() == "LocForestFlatwoodsLocation"));
 }
 
 #[test]
 fn resolve_nuka_instances() {
     let Some(c) = conn() else { return };
     let r = search(&c, &all_params("Nuka Cola")).unwrap();
-    let g = r.iter().find(|x| matches!(x, SearchResult::Grouped(_))).unwrap().clone();
+    let g = r
+        .iter()
+        .find(|x| matches!(x, SearchResult::Grouped(_)))
+        .unwrap()
+        .clone();
     let space = g.space().clone();
     let inst = mappalachia_core::instances::instances(&c, g, &space).unwrap();
     assert!(!inst.is_empty());
@@ -131,11 +133,18 @@ fn resolve_nuka_instances() {
 fn teleporters_and_zrange() {
     let Some(c) = conn() else { return };
     let spaces = mappalachia_core::db::all_spaces(&c).unwrap();
-    let app = spaces.iter().find(|s| s.editor_id() == "APPALACHIA").unwrap();
+    let app = spaces
+        .iter()
+        .find(|s| s.editor_id() == "APPALACHIA")
+        .unwrap();
     let t = mappalachia_core::instances::teleporters(&c, app).unwrap();
     assert!(!t.is_empty());
     let r = search(&c, &all_params("Nuka Cola")).unwrap();
-    let grouped: Vec<_> = r.into_iter().filter(|x| matches!(x, SearchResult::Grouped(_))).take(3).collect();
+    let grouped: Vec<_> = r
+        .into_iter()
+        .filter(|x| matches!(x, SearchResult::Grouped(_)))
+        .take(3)
+        .collect();
     let (lo, hi) = mappalachia_core::instances::z_range(&c, &grouped, app).unwrap();
     assert!(hi >= lo);
 }

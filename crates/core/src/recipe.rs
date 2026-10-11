@@ -48,7 +48,7 @@ use serde_json::{Map, Value};
 
 use crate::enums::{FluxColor, LockLevel, Signature};
 use crate::model::{Entity, EntityKind, Space};
-use crate::search::{Grouped, SearchResult};
+use crate::search::{Grouped, SearchResult, StoredPlotIcon};
 
 // ---------------------------------------------------------------------------
 // Tables (index order == C# declaration order, i.e. the STJ numeric form)
@@ -375,12 +375,91 @@ fn grouped_to_json(g: &Grouped) -> Value {
         Value::from(lock_level_index(g.lock_level)),
     );
     m.insert("InContainer".to_string(), Value::Bool(g.in_container));
+    // C# `GroupedSearchResult.LegendGroup` / `LegendText` / `PlotIcon`
+    // (`BaseIconImage` has a private getter, so it is never on the wire).
+    // `LegendText` / `PlotIcon` are omitted when absent so minimal
+    // hand-written recipes stay minimal.
+    m.insert("LegendGroup".to_string(), Value::from(g.legend_group));
+    if let Some(text) = &g.legend_text {
+        m.insert("LegendText".to_string(), Value::String(text.clone()));
+    }
+    if let Some(icon) = &g.plot_icon {
+        m.insert("PlotIcon".to_string(), stored_plot_icon_to_json(icon));
+    }
     Value::Object(m)
+}
+
+/// Serializes the wire half of C# `PlotIcon`: `DoNotUseIcon`,
+/// `BaseIconIndex`, `Size`, `Color` (`#rrggbb`). Fields that are `None`
+/// are omitted (forward-compat partial icons).
+fn stored_plot_icon_to_json(p: &StoredPlotIcon) -> Value {
+    let mut m = Map::new();
+    if let Some(do_not_use) = p.do_not_use_icon {
+        m.insert("DoNotUseIcon".to_string(), Value::Bool(do_not_use));
+    }
+    if let Some(index) = p.base_icon_index {
+        m.insert(
+            "BaseIconIndex".to_string(),
+            Value::from(u64::try_from(index).unwrap_or(u64::MAX)),
+        );
+    }
+    if let Some(size) = p.size {
+        m.insert("Size".to_string(), Value::from(u64::from(size)));
+    }
+    if let Some((r, g, b)) = p.color {
+        m.insert("Color".to_string(), Value::String(html_color(r, g, b)));
+    }
+    Value::Object(m)
+}
+
+/// Reads an optional JSON integer (`LegendGroup`, `BaseIconIndex`, `Size`
+/// accept the STJ numeric form; negatives clamp for unsigned targets).
+fn get_opt_i64(v: &Value, key: &str) -> Option<i64> {
+    match v.get(key) {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
+        Some(_) => None,
+    }
+}
+
+fn stored_plot_icon_from_json(v: &Value) -> Result<StoredPlotIcon, String> {
+    if !v.is_object() {
+        return Err("Invalid PlotIcon".to_string());
+    }
+    let do_not_use_icon = v.get("DoNotUseIcon").and_then(Value::as_bool);
+    let base_icon_index = get_opt_i64(v, "BaseIconIndex").and_then(|n| usize::try_from(n).ok());
+    let size = get_opt_i64(v, "Size").and_then(|n| u32::try_from(n).ok());
+    let color = v
+        .get("Color")
+        .and_then(Value::as_str)
+        .and_then(parse_html_color);
+    Ok(StoredPlotIcon {
+        do_not_use_icon,
+        base_icon_index,
+        size,
+        color,
+    })
 }
 
 fn grouped_from_json(v: &Value) -> Result<Grouped, String> {
     let entity = entity_from_json(v.get("Entity").ok_or("Missing Entity")?)?;
     let space = space_from_json(v.get("Space").ok_or("Missing Space")?)?;
+    // `LegendGroup` defaults to 0 when absent (C# default); `LegendText`
+    // and `PlotIcon` stay `None` so callers fall back to the
+    // `legend_text()` computation / `FormMain` fresh assignment.
+    let legend_group = get_opt_i64(v, "LegendGroup")
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(0);
+    let legend_text = v
+        .get("LegendText")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let plot_icon = match v.get("PlotIcon") {
+        None | Some(Value::Null) => None,
+        Some(icon) => Some(stored_plot_icon_from_json(icon)?),
+    };
     Ok(Grouped {
         entity,
         space,
@@ -392,6 +471,9 @@ fn grouped_from_json(v: &Value) -> Result<Grouped, String> {
         label: get_str(v, "Label"),
         lock_level: parse_lock_level_value(v)?,
         in_container: get_bool(v, "InContainer"),
+        legend_group,
+        legend_text,
+        plot_icon,
     })
 }
 
