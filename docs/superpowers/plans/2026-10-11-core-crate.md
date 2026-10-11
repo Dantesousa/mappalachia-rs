@@ -158,12 +158,12 @@ Expected: FAIL, `enums.rs` doesn't exist.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Port `Library/Entity.cs` (Signature, 34 variants), `Library/BaseInstance.cs` (LockLevel, 11 variants), `Library/Common.cs` (FluxColor: Crimson, Cobalt, Fluorescent, Violet, Yellowcake), `Library/Shape.cs` (ShapeType: Box, Sphere, Line, Plane, Ellipsoid, Cylinder), and all `DataTranslator.cs` mappings verbatim. Rust variant names must be valid identifiers: `NPC_`→`Npc`, `LVLI`→`Lvli`, etc. `parse` accepts the exact C# enum names (`"NPC_"`, `"LVLI"`, `"RequiresTerminal"`…). LockLevel friendly names verbatim ("Level 0", "Requires Key", "Not Locked" for `to_friendly_name_with_context` on None). Signature friendly names + descriptions verbatim from DataTranslator (34 entries each).
+Port `Library/Entity.cs` (Signature, 35 variants), `Library/BaseInstance.cs` (LockLevel, 11 variants), `Library/Common.cs` (FluxColor: Crimson, Cobalt, Fluorescent, Violet, Yellowcake), `Library/Shape.cs` (ShapeType: Box, Sphere, Line, Plane, Ellipsoid, Cylinder), and all `DataTranslator.cs` mappings verbatim. Rust variant names must be valid identifiers: `NPC_`→`Npc`, `LVLI`→`Lvli`, etc. `parse` accepts the exact C# enum names (`"NPC_"`, `"LVLI"`, `"RequiresTerminal"`…). LockLevel friendly names verbatim ("Level 0", "Requires Key", "Not Locked" for `to_friendly_name_with_context` on None). Signature friendly names + descriptions verbatim from DataTranslator (35 entries each).
 
 ```rust
-// crates/core/src/enums.rs (shape; fill all 34 signatures + 11 lock levels)
+// crates/core/src/enums.rs (shape; fill all 35 signatures + 11 lock levels)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum Signature { Lvli, Flora, Npc, Misc, Book, Alch, Container, Stat, Scol, Mstt, Furn, Note, Term, Armo, Weapon, Ammo, Proj, Currency, Key, Region, Location, Acti, Tact, Trap, Door, Hazd, Idlm, Light, Sech, Aspc, Txst, Bnds, World, Cell }
+pub enum Signature { Lvli, Flora, Npc, Misc, Book, Alch, Container, Stat, Scol, Mstt, Furn, Note, Term, Armo, Weapon, Ammo, Proj, Currency, Key, Region, Location, Acti, Tact, Trap, Door, Hazd, Idlm, Light, Soun, Sech, Aspc, Txst, Bnds, World, Cell }
 
 impl std::str::FromStr for Signature {
     type Err = String;
@@ -191,7 +191,7 @@ impl std::str::FromStr for Signature {
 impl Signature {
     /// Mirrors `Enum.GetValues<Signature>().Where(s => s.IsRecommendedSelection())`.
     pub fn recommended_default() -> Vec<Signature> {
-        [Signature::Lvli, Signature::Flora, Signature::Npc, Signature::Misc, Signature::Book,
+        [Signature::Acti, Signature::Lvli, Signature::Flora, Signature::Npc, Signature::Misc, Signature::Book,
          Signature::Alch, Signature::Ammo, Signature::Armo, Signature::Currency, Signature::Container,
          Signature::Furn, Signature::Key, Signature::Region, Signature::Location, Signature::Term,
          Signature::Trap, Signature::Proj, Signature::Note, Signature::Weapon].to_vec()
@@ -331,8 +331,8 @@ fn meta_and_spaces() {
     assert_eq!(db::game_version(&c).unwrap(), "1.7.26.13");
     let spaces = db::all_spaces(&c).unwrap();
     assert_eq!(spaces.len(), 205);
-    let app = spaces.iter().find(|s| s.editor_id == "APPALACHIA").unwrap();
-    assert_eq!(app.form_id, 2480661);
+    let app = spaces.iter().find(|s| s.editor_id() == "APPALACHIA").unwrap();
+    assert_eq!(app.form_id(), 2480661);
 }
 #[test]
 fn markers_and_globals() {
@@ -413,7 +413,8 @@ fn all_params(term: &str) -> SearchParams {
 fn search_nuka_cola() {
     let Some(c) = conn() else { return };
     let r = search(&c, &all_params("Nuka Cola")).unwrap();
-    assert_eq!(r.len(), 586); // standard rows for "Nuka%Cola", all spaces
+    // Verbatim C# semantics: 339 standard + 8 container groups + 1 location = 348.
+    assert_eq!(r.len(), 348);
 }
 #[test]
 fn search_scrap_steel() {
@@ -434,7 +435,7 @@ fn search_flux_crimson() {
     let Some(c) = conn() else { return };
     let r = search(&c, &all_params("Crimson")).unwrap();
     let total: i64 = r.iter().filter(|x| matches!(x.entity_kind(), EntityKind::DerivedFlux(_))).map(|x| x.count()).sum();
-    assert_eq!(total, 6497);
+    assert_eq!(total, 5677); // nukable (Appalachia-only) filter applied, per C# line 227
 }
 #[test]
 fn search_form_id_instance() {
@@ -452,7 +453,7 @@ fn search_region_and_location() {
 }
 ```
 
-Expected counts measured 2026-10-11 against release DB (game 1.7.26.13): standard rows 586, scrap Steel 21795, NPC Scorched 1731, flux Crimson 6497.
+Expected counts measured 2026-10-11 against release DB (game 1.7.26.13) under verbatim C# semantics: Nuka Cola 348 (339 standard + 8 container + 1 location), scrap Steel 21795, NPC Scorched 1731, flux Crimson 5677 (nukable-only).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -565,13 +566,13 @@ fn resolve_nuka_instances() {
     let space = g.space().clone();
     let inst = mappalachia_core::instances::instances(&c, g, &space).unwrap();
     assert!(!inst.is_empty());
-    assert!(inst.iter().all(|i| i.space.form_id == space.form_id));
+    assert!(inst.iter().all(|i| i.space.form_id() == space.form_id()));
 }
 #[test]
 fn teleporters_and_zrange() {
     let Some(c) = conn() else { return };
     let spaces = mappalachia_core::db::all_spaces(&c).unwrap();
-    let app = spaces.iter().find(|s| s.editor_id == "APPALACHIA").unwrap();
+    let app = spaces.iter().find(|s| s.editor_id() == "APPALACHIA").unwrap();
     let t = mappalachia_core::instances::teleporters(&c, app).unwrap();
     assert!(!t.is_empty());
     let r = search(&c, &all_params("Nuka Cola")).unwrap();
@@ -629,11 +630,11 @@ fn recipe_round_trip() {
 "Space":{"FormID":2480661,"EditorID":"APPALACHIA","DisplayName":"Appalachia","Signature":"WRLD"},
 "Count":5,"SpawnWeight":1.0,"Label":"","LockLevel":"None","InContainer":false}]}"#;
     let r: Recipe = serde_json::from_str(json).unwrap();
-    assert_eq!(r.space.editor_id, "APPALACHIA");
+    assert_eq!(r.space.editor_id(), "APPALACHIA");
     assert_eq!(r.items_to_plot.len(), 1);
     let back = serde_json::to_string(&r).unwrap();
     let r2: Recipe = serde_json::from_str(&back).unwrap();
-    assert_eq!(r2.items_to_plot[0].count, 5);
+    assert_eq!(r2.items_to_plot[0].count(), 5);
 }
 #[test]
 fn legend_text_rules() {
