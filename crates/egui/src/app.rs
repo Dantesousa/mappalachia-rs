@@ -1,11 +1,14 @@
 use mappalachia_core::{
+    common::MAP_IMAGE_RESOLUTION,
     db,
     enums::{LockLevel, Signature},
     model::{EntityKind, Space},
     search::{search, Grouped, SearchParams, SearchResult},
 };
 use mappalachia_render::{
+    assets::Assets,
     color::Rgba,
+    draw::{draw, DrawInput, Plottable},
     icon::PlotIcon,
     settings::{
         BackgroundImageType, CompassStyle, LegendHorizontalAlignment, LegendStyle,
@@ -73,7 +76,28 @@ pub struct App {
     /// `PlotSettings.Mode`, locked to `Standard` until the modes plan
     /// (other modes appear greyed with "(soon)" in the combo).
     pub plot_mode: PlotMode,
+    /// Background-thread preview state (Task 4): the worker thread renders
+    /// and sends straight-alpha RGBA bytes over `preview_rx`; the UI
+    /// thread polls and uploads the texture. Never touched off-thread.
+    pub preview: PreviewState,
+    /// Live channel while `preview == Rendering`; `None` otherwise.
+    preview_rx: Option<std::sync::mpsc::Receiver<PreviewResult>>,
 }
+
+/// Preview lifecycle: idle, worker running, uploaded texture, or worker
+/// error text. Only the `PreviewResult` payload crosses threads; the
+/// `egui::TextureHandle` is created on the UI thread from those bytes.
+pub enum PreviewState {
+    Idle,
+    Rendering,
+    Ready(egui::TextureHandle),
+    Failed(String),
+}
+
+/// What the preview worker sends home: straight-alpha RGBA bytes
+/// (`4096*4096*4`, ready for
+/// `egui::ColorImage::from_rgba_unmultiplied`) or an error string.
+type PreviewResult = Result<Vec<u8>, String>;
 
 /// Typed draw inputs resolved from [`App`] UI state (cf. C#
 /// `Recipe.AsSettings` minus recipe I/O): the stored full-DB [`Space`]
@@ -84,9 +108,8 @@ pub struct App {
 /// There is no `render::settings::Settings` root type (the render crate
 /// deliberately did not port C# `Settings.cs`: its `Space` setter is
 /// DB-coupled), so this local struct is the conversion target. Consumed by
-/// the Task 4 preview worker; until then it is only exercised by tests.
+/// the Task 4 preview worker (`start_preview` clones it onto the thread).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DrawSettings {
     pub space: Space,
     pub map: MapSettings,
@@ -147,6 +170,8 @@ impl App {
             show_infestations: false,
             plot_style: PlotStyleSettings::default(),
             plot_mode: PlotMode::Standard,
+            preview: PreviewState::Idle,
+            preview_rx: None,
         }
     }
 
@@ -155,7 +180,6 @@ impl App {
     /// state (all other typed fields keep their C# defaults). Brightness is
     /// clamped to 0.1–2.0 like the C# setter. Returns `None` when no spaces
     /// are loaded (DB path unset or unreadable).
-    #[allow(dead_code)]
     pub fn draw_settings(&self) -> Option<DrawSettings> {
         let space = self.spaces.get(self.space_idx)?.clone();
         let map = MapSettings {
@@ -178,6 +202,84 @@ impl App {
             ..PlotSettings::default()
         };
         Some(DrawSettings { space, map, plot })
+    }
+
+    /// Spawn the preview worker: clones the current items + [`DrawSettings`]
+    /// plus the DB/assets paths onto a `std::thread` running
+    /// [`render_preview_bytes`]; the bytes come back over an `mpsc`
+    /// channel and are uploaded as a texture by [`App::poll_preview`] on
+    /// the UI thread. No-op while already `Rendering`. Never touches the
+    /// egui `Context` off-thread — only the [`PreviewResult`] crosses.
+    pub fn start_preview(&mut self) {
+        if matches!(self.preview, PreviewState::Rendering) {
+            return;
+        }
+        let Some(settings) = self.draw_settings() else {
+            let msg = "Cannot render: no spaces loaded.".to_string();
+            self.status = msg.clone();
+            self.preview = PreviewState::Failed(msg);
+            return;
+        };
+        let (Some(db_path), Some(assets_root)) = (self.db_path.clone(), self.assets_root.clone())
+        else {
+            let msg = "Cannot render: MAPPALACHIA_DB / MAPPALACHIA_ASSETS not set.".to_string();
+            self.status = msg.clone();
+            self.preview = PreviewState::Failed(msg);
+            return;
+        };
+        let items = self.items.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<PreviewResult>();
+        self.preview_rx = Some(rx);
+        self.preview = PreviewState::Rendering;
+        self.status = "Rendering...".to_string();
+        std::thread::spawn(move || {
+            let out = render_preview_bytes(&db_path, &assets_root, settings, items);
+            let _ = tx.send(out);
+        });
+    }
+
+    /// Poll the preview worker (call once per frame from `update`):
+    /// on payload upload `ColorImage::from_rgba_unmultiplied` bytes as a
+    /// texture; on error record `Failed`. Keeps repainting while the
+    /// worker runs so the result is picked up promptly.
+    fn poll_preview(&mut self, ctx: &egui::Context) {
+        enum Outcome {
+            None,
+            Empty,
+            Got(PreviewResult),
+            Disconnected,
+        }
+        let outcome = match &self.preview_rx {
+            None => Outcome::None,
+            Some(rx) => match rx.try_recv() {
+                Ok(res) => Outcome::Got(res),
+                Err(std::sync::mpsc::TryRecvError::Empty) => Outcome::Empty,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Outcome::Disconnected,
+            },
+        };
+        match outcome {
+            Outcome::None => {}
+            Outcome::Empty => ctx.request_repaint(),
+            Outcome::Got(Ok(bytes)) => {
+                self.preview_rx = None;
+                let side = MAP_IMAGE_RESOLUTION as usize;
+                let img = egui::ColorImage::from_rgba_unmultiplied([side, side], &bytes);
+                let tex = ctx.load_texture("preview", img, Default::default());
+                self.preview = PreviewState::Ready(tex);
+                self.status = "Preview ready.".to_string();
+            }
+            Outcome::Got(Err(e)) => {
+                self.preview_rx = None;
+                self.status = e.clone();
+                self.preview = PreviewState::Failed(e);
+            }
+            Outcome::Disconnected => {
+                self.preview_rx = None;
+                let msg = "Preview worker died.".to_string();
+                self.status = msg.clone();
+                self.preview = PreviewState::Failed(msg);
+            }
+        }
     }
 
     /// Mirrors the `FormMain` search flow: `core::search` with the default
@@ -287,6 +389,58 @@ impl App {
     }
 }
 
+/// Run the Standard render off-thread: open the DB + assets on the worker,
+/// plot the current items as-is (icons/groups already assigned by
+/// `add_selected`, mirroring the C# CLI path which plots stored
+/// `ItemsToPlot` untouched), and return straight-alpha RGBA bytes for
+/// `ColorImage::from_rgba_unmultiplied`. Errors become strings so the
+/// whole [`PreviewResult`] stays `Send + 'static`.
+fn render_preview_bytes(
+    db_path: &str,
+    assets_root: &str,
+    settings: DrawSettings,
+    items: Vec<PlotItem>,
+) -> PreviewResult {
+    let conn = db::open_readonly(db_path).map_err(|e| format!("DB open failed: {e}"))?;
+    let mut assets = Assets::open(assets_root);
+    let plottables: Vec<Plottable> = items
+        .into_iter()
+        .map(|it| Plottable {
+            result: it.result,
+            legend_group: it.legend_group as i32,
+            legend_text: it.legend,
+            icon: it.icon,
+        })
+        .collect();
+    let pix = draw(DrawInput {
+        conn: &conn,
+        assets: &mut assets,
+        space: settings.space,
+        map: settings.map,
+        plot: settings.plot,
+        items: plottables,
+    })
+    .map_err(|e| format!("Render failed: {e}"))?;
+    Ok(straight_rgba_bytes(&pix))
+}
+
+/// Unpremultiply a rendered (premultiplied) canvas to straight-alpha RGBA
+/// bytes, mirroring `canvas::straight_pixel` per pixel.
+fn straight_rgba_bytes(pix: &tiny_skia::Pixmap) -> Vec<u8> {
+    let mut out = Vec::with_capacity((pix.width() * pix.height() * 4) as usize);
+    let (chunks, _) = pix.data().as_chunks::<4>();
+    for px in chunks {
+        let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+        if a == 0 || a == 255 {
+            out.extend_from_slice(&[r, g, b, a]);
+        } else {
+            let un = |c: u8| ((u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a)) as u8;
+            out.extend_from_slice(&[un(r), un(g), un(b), a]);
+        }
+    }
+    out
+}
+
 /// Identity of a search result, used to dedupe adds and to match items back
 /// to the results they were added from.
 fn result_key(r: &SearchResult) -> (String, u32, u32, Option<u32>) {
@@ -335,6 +489,7 @@ impl Default for App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_preview(ctx);
         egui::SidePanel::left("search_panel")
             .resizable(true)
             .show(ctx, |ui| {
@@ -527,7 +682,30 @@ impl eframe::App for App {
                     }
                 });
             ui.separator();
-            ui.label("Plot panel (Task 4): pending");
+            ui.heading("Preview");
+            let rendering = matches!(self.preview, PreviewState::Rendering);
+            if ui
+                .add_enabled(!rendering, egui::Button::new("Render preview"))
+                .clicked()
+            {
+                self.start_preview();
+            }
+            match &self.preview {
+                PreviewState::Idle => {
+                    ui.label("Preview idle. Add items, then Render preview.");
+                }
+                PreviewState::Rendering => {
+                    ui.label("Rendering...");
+                }
+                PreviewState::Ready(tex) => {
+                    ui.label("Preview ready.");
+                    let avail = ui.available_size();
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(avail));
+                }
+                PreviewState::Failed(e) => {
+                    ui.label(format!("Preview failed: {e}"));
+                }
+            }
             ui.label("Export panel (Task 5): pending");
         });
     }
@@ -537,6 +715,7 @@ impl eframe::App for App {
 mod tests {
     use super::*;
     use mappalachia_core::db::all_spaces;
+    use std::path::Path;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -719,5 +898,83 @@ mod tests {
     fn draw_settings_none_without_spaces() {
         let app = App::from_parts(None, None, Vec::new());
         assert!(app.draw_settings().is_none());
+    }
+
+    /// Task 4 RED: background-thread preview.
+    ///
+    /// Requires `MAPPALACHIA_ASSETS` + `MAPPALACHIA_DB`; SKIPs when either
+    /// is unset or missing (same skip-pattern as the render golden tests).
+    fn preview_app_with_item() -> Option<App> {
+        let (db_path, assets_root) = {
+            let _guard = ENV_LOCK.lock().unwrap();
+            (
+                std::env::var("MAPPALACHIA_DB").ok(),
+                std::env::var("MAPPALACHIA_ASSETS").ok(),
+            )
+        };
+        let (db_path, assets_root) = match (db_path, assets_root) {
+            (Some(d), Some(a)) if Path::new(&d).exists() && Path::new(&a).is_dir() => (d, a),
+            _ => {
+                eprintln!("SKIP: set MAPPALACHIA_ASSETS and MAPPALACHIA_DB");
+                return None;
+            }
+        };
+        let conn = db::open_readonly(&db_path).expect("test DB opens");
+        let spaces = all_spaces(&conn).expect("spaces load");
+        let mut app = App::from_parts(Some(db_path), Some(assets_root), spaces);
+        app.search_term = "Nuka Cola".to_string();
+        app.run_search().expect("search succeeds");
+        assert!(
+            !app.results.is_empty(),
+            "expected rows for 'Nuka Cola' in APPALACHIA"
+        );
+        app.checked[0] = true;
+        app.add_selected();
+        assert_eq!(app.items.len(), 1);
+        Some(app)
+    }
+
+    #[test]
+    fn preview_renders_1_item_4096_and_nonempty() {
+        let Some(app) = preview_app_with_item() else {
+            return;
+        };
+        let ds = app.draw_settings().expect("spaces present");
+        let bytes = render_preview_bytes(
+            app.db_path.as_deref().expect("db path"),
+            app.assets_root.as_deref().expect("assets root"),
+            ds,
+            app.items.clone(),
+        )
+        .expect("render succeeds");
+        assert_eq!(
+            bytes.len(),
+            (MAP_IMAGE_RESOLUTION as usize) * (MAP_IMAGE_RESOLUTION as usize) * 4
+        );
+        assert!(
+            bytes.iter().any(|&b| b != 0),
+            "rendered 1-item Standard pixmap must be non-empty"
+        );
+    }
+
+    #[test]
+    fn preview_channel_round_trip_delivers_bytes() {
+        let (tx, rx) = std::sync::mpsc::channel::<PreviewResult>();
+        let payload = vec![1u8, 2, 3, 4];
+        std::thread::spawn(move || {
+            let _ = tx.send(Ok(payload));
+        })
+        .join()
+        .expect("worker joins");
+        let got = rx.try_recv().expect("payload delivered");
+        assert_eq!(got.expect("ok payload"), vec![1u8, 2, 3, 4]);
+    }
+
+    #[test]
+    fn preview_without_envs_fails_without_spawning() {
+        let mut app = App::from_parts(None, None, Vec::new());
+        app.start_preview();
+        assert!(matches!(app.preview, PreviewState::Failed(_)));
+        assert!(app.preview_rx.is_none());
     }
 }

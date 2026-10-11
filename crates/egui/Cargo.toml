@@ -8,3 +8,4 @@ mappalachia-core = { path = "../core" }
 mappalachia-render = { path = "../render" }
 eframe = "0.32"
 egui = "0.32"
+tiny-skia = "0.11"

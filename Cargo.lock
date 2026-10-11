@@ -2186,6 +2186,7 @@ dependencies = [
  "egui",
  "mappalachia-core",
  "mappalachia-render",
+ "tiny-skia",
 ]
 
 [[package]]
