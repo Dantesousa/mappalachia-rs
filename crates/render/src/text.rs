@@ -293,6 +293,21 @@ impl Font {
         self.paint(canvas, &layout, px, color, |_| x, y, true);
     }
 
+    /// Draw left-aligned at (`x`,`y`) with NO shadow; mirrors the plain
+    /// `DrawString` calls (coordinate-grid labels, `Map.cs:292-293`).
+    pub fn draw_plain(
+        &self,
+        canvas: &mut Pixmap,
+        text: &str,
+        px: f32,
+        color: Rgba,
+        x: f32,
+        y: f32,
+    ) {
+        let layout = self.layout(text, px, None);
+        self.paint(canvas, &layout, px, color, |_| x, y, false);
+    }
+
     /// Mirrors `DrawStringCentered`: center on (`cx`,`cy`), vertically
     /// centered (`center_vert`) or top-aligned, optional wrap width. Each
     /// wrapped line is centered, like GDI+ `Center` alignment.

@@ -34,6 +34,9 @@ fn solid_paint(color: Rgba) -> Paint<'static> {
 fn stroke_of(width: f32) -> Stroke {
     Stroke {
         width,
+        // GDI+ `Pen` default miter limit (tiny-skia's own default is 4.0);
+        // acute polygon joins must match, e.g. region outlines.
+        miter_limit: 10.0,
         ..Default::default()
     }
 }
@@ -158,45 +161,102 @@ pub fn rotate_blit(
 
 /// Solid rectangle fill. Mirrors `FillRectangle`.
 pub fn fill_rect(dst: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Rgba) {
+    fill_rect_xform(dst, x, y, w, h, color, Transform::identity());
+}
+
+/// Solid rectangle fill under `transform`. Mirrors the shape draws
+/// (`Map.cs:948-950`: translate/rotate/translate about the shape center).
+pub fn fill_rect_xform(
+    dst: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: Rgba,
+    transform: Transform,
+) {
     let rect = Rect::from_xywh(x, y, w, h).expect("valid rect");
-    dst.fill_rect(rect, &solid_paint(color), Transform::identity(), None);
+    dst.fill_rect(rect, &solid_paint(color), transform, None);
 }
 
 /// Rectangle outline. Mirrors `DrawRectangle(pen, rect)`.
 pub fn stroke_rect(dst: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Rgba, width: f32) {
+    stroke_rect_xform(dst, x, y, w, h, color, width, Transform::identity());
+}
+
+/// Rectangle outline under `transform` (see [`fill_rect_xform`]).
+#[allow(clippy::too_many_arguments)]
+pub fn stroke_rect_xform(
+    dst: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: Rgba,
+    width: f32,
+    transform: Transform,
+) {
     let rect = Rect::from_xywh(x, y, w, h).expect("valid rect");
     let path = PathBuilder::from_rect(rect);
     dst.stroke_path(
         &path,
         &solid_paint(color),
         &stroke_of(width),
-        Transform::identity(),
+        transform,
         None,
     );
 }
 
 /// Solid ellipse bounded by the rect. Mirrors `FillEllipse`.
 pub fn fill_ellipse(dst: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Rgba) {
+    fill_ellipse_xform(dst, x, y, w, h, color, Transform::identity());
+}
+
+/// Solid ellipse under `transform` (see [`fill_rect_xform`]).
+pub fn fill_ellipse_xform(
+    dst: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: Rgba,
+    transform: Transform,
+) {
     let rect = Rect::from_xywh(x, y, w, h).expect("valid rect");
     let path = PathBuilder::from_oval(rect).expect("valid oval");
     dst.fill_path(
         &path,
         &solid_paint(color),
         FillRule::Winding,
-        Transform::identity(),
+        transform,
         None,
     );
 }
 
 /// Ellipse outline. Mirrors `DrawEllipse(pen, rect)`.
 pub fn stroke_ellipse(dst: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Rgba, width: f32) {
+    stroke_ellipse_xform(dst, x, y, w, h, color, width, Transform::identity());
+}
+
+/// Ellipse outline under `transform` (see [`fill_rect_xform`]).
+#[allow(clippy::too_many_arguments)]
+pub fn stroke_ellipse_xform(
+    dst: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: Rgba,
+    width: f32,
+    transform: Transform,
+) {
     let rect = Rect::from_xywh(x, y, w, h).expect("valid rect");
     let path = PathBuilder::from_oval(rect).expect("valid oval");
     dst.stroke_path(
         &path,
         &solid_paint(color),
         &stroke_of(width),
-        Transform::identity(),
+        transform,
         None,
     );
 }

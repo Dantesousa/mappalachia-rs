@@ -77,6 +77,18 @@ pub fn blast_radius(c: &Connection) -> Result<f64> {
     global(c, "EN07_NukeBlastRadius")
 }
 
+/// Mirrors C# `Database.PopulateFromData` (`Database.cs:858-861`): resolve
+/// a (typically recipe-deserialized, `max_range == 0`) space against the
+/// database, matching by entity equality (`form_id + editor_id`), and error
+/// (`QueryReturnedNoRows`) when no row matches — mirroring the C# throw.
+pub fn populate_from_data(conn: &Connection, space: &Space) -> Result<Space> {
+    let spaces = all_spaces(conn)?;
+    spaces
+        .into_iter()
+        .find(|s| *s == *space)
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
 /// Mirrors C# `Database.GetInfestationRadius`
 /// (`HTO_LCP_HostileTakeOver_TargetRadius_Location`).
 pub fn infestation_radius(c: &Connection) -> Result<f64> {
