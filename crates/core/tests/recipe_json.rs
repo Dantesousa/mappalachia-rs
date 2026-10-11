@@ -1,7 +1,7 @@
 use mappalachia_core::enums::{FluxColor, LockLevel, Signature};
 use mappalachia_core::model::{Entity, EntityKind, Space};
 use mappalachia_core::recipe::{html_color, load_recipe_file, parse_html_color, Recipe};
-use mappalachia_core::search::{Grouped, SearchResult};
+use mappalachia_core::search::{Grouped, SearchResult, StoredPlotIcon};
 
 fn appalachia() -> Space {
     Space::new(
@@ -32,6 +32,9 @@ fn standard_nuka(space: &Space) -> Grouped {
         label: String::new(),
         lock_level: LockLevel::None,
         in_container: false,
+        legend_group: 0,
+        legend_text: None,
+        plot_icon: None,
     }
 }
 
@@ -97,6 +100,9 @@ fn legend_derived_npc_uses_display_name_and_percent() {
         label: String::new(),
         lock_level: LockLevel::None,
         in_container: false,
+        legend_group: 0,
+        legend_text: None,
+        plot_icon: None,
     };
     assert_eq!(g.legend_text(true), "4x Derived Opossum Spawn [50%]");
     assert_eq!(g.legend_text(false), "Derived Opossum Spawn [50%]");
@@ -113,6 +119,9 @@ fn legend_derived_npc_with_label_and_lock_renders_context() {
         label: "camp".to_string(),
         lock_level: LockLevel::Level1,
         in_container: false,
+        legend_group: 0,
+        legend_text: None,
+        plot_icon: None,
     };
     assert_eq!(
         g.legend_text(false),
@@ -131,6 +140,9 @@ fn legend_derived_scrap_appends_quantity() {
         label: String::new(),
         lock_level: LockLevel::None,
         in_container: false,
+        legend_group: 0,
+        legend_text: None,
+        plot_icon: None,
     };
     assert_eq!(g.legend_text(true), "3x Derived Steel Scrap [x2]");
 }
@@ -146,6 +158,9 @@ fn legend_derived_flux_has_no_suffix() {
         label: String::new(),
         lock_level: LockLevel::None,
         in_container: false,
+        legend_group: 0,
+        legend_text: None,
+        plot_icon: None,
     };
     assert_eq!(g.legend_text(false), "Derived Raw Violet Flux");
 }
@@ -197,6 +212,9 @@ fn legend_region_uses_editor_id_branch() {
         label: String::new(),
         lock_level: LockLevel::None,
         in_container: false,
+        legend_group: 0,
+        legend_text: None,
+        plot_icon: None,
     };
     assert_eq!(g.legend_text(false), "TestRegion");
 }
@@ -218,6 +236,9 @@ fn entity_child_type_omitted_for_standard_only() {
                 label: String::new(),
                 lock_level: LockLevel::None,
                 in_container: false,
+                legend_group: 0,
+                legend_text: None,
+                plot_icon: None,
             }),
         ],
     };
@@ -332,4 +353,123 @@ fn load_recipe_file_reads_from_disk() {
     assert_eq!(r.plot_settings.mode(), "Standard");
     std::fs::remove_file(&path).ok();
     assert!(load_recipe_file(&path).is_err());
+}
+
+#[test]
+fn legend_fields_round_trip() {
+    let space = appalachia();
+    let mut grouped = standard_nuka(&space);
+    grouped.legend_group = 3;
+    grouped.legend_text = Some("5x Custom Legend".to_string());
+    grouped.plot_icon = Some(StoredPlotIcon {
+        do_not_use_icon: Some(false),
+        base_icon_index: Some(2),
+        size: Some(42),
+        color: Some((255, 0, 128)),
+    });
+    let recipe = Recipe {
+        space: space.clone(),
+        map_settings: serde_json::json!({}).into(),
+        plot_settings: serde_json::json!({}).into(),
+        items_to_plot: vec![
+            SearchResult::Grouped(grouped),
+            SearchResult::Singular {
+                inner: Grouped {
+                    entity: Entity::derived_npc("Opossum"),
+                    space: space.clone(),
+                    count: 2,
+                    spawn_weight: 0.5,
+                    label: String::new(),
+                    lock_level: LockLevel::None,
+                    in_container: false,
+                    legend_group: 3,
+                    legend_text: Some("shared group text".to_string()),
+                    plot_icon: Some(StoredPlotIcon {
+                        do_not_use_icon: Some(false),
+                        base_icon_index: Some(2),
+                        size: Some(42),
+                        color: Some((255, 0, 128)),
+                    }),
+                },
+                instance_form_id: 0xABCD,
+            },
+        ],
+    };
+    let back = serde_json::to_string(&recipe).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&back).unwrap();
+    let items = v["ItemsToPlot"].as_array().unwrap();
+    // Wire shape mirrors the C# property names.
+    assert_eq!(items[0]["LegendGroup"], 3);
+    assert_eq!(items[0]["LegendText"], "5x Custom Legend");
+    assert_eq!(items[0]["PlotIcon"]["DoNotUseIcon"], false);
+    assert_eq!(items[0]["PlotIcon"]["BaseIconIndex"], 2);
+    assert_eq!(items[0]["PlotIcon"]["Size"], 42);
+    assert_eq!(items[0]["PlotIcon"]["Color"], "#ff0080");
+    // The image itself is never on the wire (private getter in C#).
+    assert!(items[0]["PlotIcon"].get("BaseIconImage").is_none());
+    assert!(items[1].get("SearchResultType").is_some());
+
+    let reread: Recipe = serde_json::from_str(&back).unwrap();
+    assert_eq!(reread.items_to_plot.len(), 2);
+    match &reread.items_to_plot[0] {
+        SearchResult::Grouped(g) => {
+            assert_eq!(g.legend_group, 3);
+            assert_eq!(g.legend_text.as_deref(), Some("5x Custom Legend"));
+            let icon = g.plot_icon.as_ref().expect("stored icon");
+            assert_eq!(icon.do_not_use_icon, Some(false));
+            assert_eq!(icon.base_icon_index, Some(2));
+            assert_eq!(icon.size, Some(42));
+            assert_eq!(icon.color, Some((255, 0, 128)));
+        }
+        SearchResult::Singular { .. } => panic!("expected grouped"),
+    }
+    match &reread.items_to_plot[1] {
+        SearchResult::Singular {
+            inner,
+            instance_form_id,
+        } => {
+            assert_eq!(*instance_form_id, 0xABCD);
+            assert_eq!(inner.legend_group, 3);
+            assert_eq!(inner.legend_text.as_deref(), Some("shared group text"));
+            assert_eq!(
+                inner.plot_icon.as_ref().and_then(|p| p.color),
+                Some((255, 0, 128))
+            );
+        }
+        SearchResult::Grouped(_) => panic!("expected singular"),
+    }
+}
+
+#[test]
+fn legend_fields_default_when_absent() {
+    // Minimal hand-written recipes (no LegendGroup/LegendText/PlotIcon)
+    // parse with the C# defaults; serializing omits the absent optionals.
+    let json = r##"{"Space":{"FormID":2480661,"EditorID":"APPALACHIA"},
+"MapSettings":{},"PlotSettings":{},
+"ItemsToPlot":[{"Entity":{"FormID":610241,"EditorID":"BMO_BunkerKey03_NukaCola_01"},
+"Space":{"FormID":2480661,"EditorID":"APPALACHIA"},
+"Count":5,"SpawnWeight":1.0,"Label":"","LockLevel":0,"InContainer":false,
+"PlotIcon":{"Color":"#FF4500"}}]}"##;
+    let r: Recipe = serde_json::from_str(json).unwrap();
+    match &r.items_to_plot[0] {
+        SearchResult::Grouped(g) => {
+            assert_eq!(g.legend_group, 0);
+            assert_eq!(g.legend_text, None);
+            let icon = g.plot_icon.as_ref().expect("partial icon parses");
+            // Partial PlotIcon objects parse: absent fields stay None.
+            assert_eq!(icon.do_not_use_icon, None);
+            assert_eq!(icon.base_icon_index, None);
+            assert_eq!(icon.size, None);
+            assert_eq!(icon.color, Some((255, 69, 0)));
+        }
+        SearchResult::Singular { .. } => panic!("expected grouped"),
+    }
+    let back = serde_json::to_string(&r).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&back).unwrap();
+    assert_eq!(v["ItemsToPlot"][0]["LegendGroup"], 0);
+    assert!(v["ItemsToPlot"][0].get("LegendText").is_none());
+    assert!(v["ItemsToPlot"][0]["PlotIcon"]
+        .get("DoNotUseIcon")
+        .is_none());
+    assert_eq!(v["ItemsToPlot"][0]["PlotIcon"]["Color"], "#ff4500");
 }

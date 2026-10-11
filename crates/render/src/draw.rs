@@ -112,11 +112,15 @@ const INFEST_EDGE: Rgba = Rgba {
 /// One search result prepared for plotting: legend grouping, legend text
 /// and plot icon assigned. Mirrors the `FormMain` add-to-plot path
 /// (`LegendGroup` per item, `PlotIcon(offset = LegendGroup, palette, size,
-/// doNotUseIcon = entity is Region or Location)`).
+/// doNotUseIcon = entity is Region or Location)`), except stored recipe
+/// values win: `LegendGroup`/`LegendText`/`PlotIcon` from the recipe are
+/// used as-is (the CLI path in `Mappalachia.cs:43-60` plots stored
+/// `ItemsToPlot` untouched), and the `FormMain` math only fills in what
+/// is absent.
 #[derive(Debug, Clone)]
 pub struct Plottable {
     pub result: SearchResult,
-    pub legend_group: usize,
+    pub legend_group: i32,
     pub legend_text: String,
     pub icon: PlotIcon,
 }
@@ -132,8 +136,18 @@ fn is_volume(kind: &EntityKind) -> bool {
     matches!(kind, EntityKind::Region | EntityKind::Location)
 }
 
-/// Assign legend groups (position order), legend text and plot icons to raw
-/// search results. `icon_count` is `Assets::plot_icon_count`.
+/// Assign legend groups, legend text and plot icons to raw search results.
+/// Stored recipe values win (mirrors the CLI path in
+/// `Mappalachia/Mappalachia.cs:43-60`, which plots stored `ItemsToPlot`
+/// as-is): `legend_group` comes from `Grouped::legend_group`, `legend_text`
+/// from `Grouped::legend_text` when non-empty, and the icon from
+/// `Grouped::plot_icon` (missing icon fields resolve via the `FormMain`
+/// math below). Only when absent do we fresh-assign like
+/// `FormMain.cs:1411-1435`: `offset = legend_group`,
+/// `color = palette[offset % palette.len()]`,
+/// `base_index = (offset / palette.len()) % icon_count`, `size` from the
+/// plot style, `do_not_use_icon` for Region/Location volumes.
+/// `icon_count` is `Assets::plot_icon_count`.
 pub fn prepare_items(
     plot: &PlotSettings,
     icon_count: usize,
@@ -146,11 +160,43 @@ pub fn prepare_items(
         .enumerate()
         .map(|(i, result)| {
             let g = grouped_of(&result);
-            let legend_text = g.legend_text(plot.include_count_in_legend);
-            let icon = PlotIcon::assign(i, palette, size, is_volume(&g.entity.kind), icon_count);
+            // Fresh items (DB search hits, minimal recipes) carry group 0;
+            // give them position order like before so each plots distinctly.
+            // Stored recipes keep their group (shared groups share icons).
+            let stored_group = g.legend_group;
+            let legend_group = if g.plot_icon.is_none()
+                && g.legend_text.as_ref().is_none_or(|t| t.is_empty())
+                && stored_group == 0
+            {
+                i32::try_from(i).unwrap_or(i32::MAX)
+            } else {
+                stored_group
+            };
+            let legend_text = g
+                .legend_text
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| g.legend_text(plot.include_count_in_legend));
+            let offset = usize::try_from(legend_group.max(0)).unwrap_or(0);
+            let fresh =
+                PlotIcon::assign(offset, palette, size, is_volume(&g.entity.kind), icon_count);
+            let icon = match &g.plot_icon {
+                None => fresh,
+                Some(stored) => PlotIcon {
+                    do_not_use_icon: stored
+                        .do_not_use_icon
+                        .unwrap_or_else(|| is_volume(&g.entity.kind)),
+                    base_index: stored.base_icon_index.unwrap_or(fresh.base_index),
+                    size: stored.size.unwrap_or(size),
+                    color: stored
+                        .color
+                        .map(|(r, gg, b)| Rgba::new(r, gg, b, 255))
+                        .unwrap_or(fresh.color),
+                },
+            };
             Plottable {
                 result,
-                legend_group: i,
+                legend_group,
                 legend_text,
                 icon,
             }

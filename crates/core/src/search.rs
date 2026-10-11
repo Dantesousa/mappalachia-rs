@@ -58,6 +58,29 @@ pub struct Grouped {
     pub label: String,
     pub lock_level: LockLevel,
     pub in_container: bool,
+    /// Mirrors C# `GroupedSearchResult.LegendGroup` (default 0).
+    pub legend_group: i32,
+    /// Mirrors C# `GroupedSearchResult.LegendText`: `None` when the recipe
+    /// carries no stored text (minimal hand-written recipes); callers fall
+    /// back to [`Grouped::legend_text`].
+    pub legend_text: Option<String>,
+    /// Mirrors C# `GroupedSearchResult.PlotIcon` (serialized without the
+    /// image): `None` when the recipe carries no stored icon; callers
+    /// fresh-assign via the `FormMain` math.
+    pub plot_icon: Option<StoredPlotIcon>,
+}
+
+/// The serializable half of C# `PlotIcon` (`PlotIcon.cs`): every field is
+/// optional so minimal hand-written recipes (no `PlotIcon` object, or a
+/// partial one) still parse. Missing fields resolve via the `FormMain`
+/// fresh-assignment math at draw time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPlotIcon {
+    pub do_not_use_icon: Option<bool>,
+    pub base_icon_index: Option<usize>,
+    pub size: Option<u32>,
+    /// RGB triple (`#rrggbb` on the wire, cf. `JsonConverterColor`).
+    pub color: Option<(u8, u8, u8)>,
 }
 
 /// Mirrors C# `GroupedSearchResult` / `SingularSearchResult`.
@@ -265,6 +288,9 @@ fn standard_search(
             label,
             lock_level: parse_lock_level(lock_raw)?,
             in_container: false,
+            legend_group: 0,
+            legend_text: None,
+            plot_icon: None,
         }));
     }
     Ok(out)
@@ -326,6 +352,9 @@ fn container_search(
             label: String::new(),
             lock_level: parse_lock_level(lock_raw)?,
             in_container: true,
+            legend_group: 0,
+            legend_text: None,
+            plot_icon: None,
         }));
     }
     Ok(out)
@@ -374,6 +403,9 @@ fn scrap_search(
             label: String::new(),
             lock_level: LockLevel::None,
             in_container: false,
+            legend_group: 0,
+            legend_text: None,
+            plot_icon: None,
         }));
     }
     Ok(out)
@@ -421,6 +453,9 @@ fn npc_search(
             label: String::new(),
             lock_level: LockLevel::None,
             in_container: false,
+            legend_group: 0,
+            legend_text: None,
+            plot_icon: None,
         }));
     }
     Ok(out)
@@ -473,6 +508,9 @@ fn flux_search(
             label: String::new(),
             lock_level: LockLevel::None,
             in_container: false,
+            legend_group: 0,
+            legend_text: None,
+            plot_icon: None,
         }));
     }
     Ok(out)
@@ -536,6 +574,9 @@ fn region_search(
             label: String::new(),
             lock_level: LockLevel::None,
             in_container: false,
+            legend_group: 0,
+            legend_text: None,
+            plot_icon: None,
         }));
     }
     Ok(out)
@@ -597,6 +638,9 @@ fn location_search(
             label: String::new(),
             lock_level: LockLevel::None,
             in_container: false,
+            legend_group: 0,
+            legend_text: None,
+            plot_icon: None,
         }));
     }
     Ok(out)
@@ -656,6 +700,9 @@ fn teleports_to_search(
             label,
             lock_level: parse_lock_level(lock_raw)?,
             in_container: false,
+            legend_group: 0,
+            legend_text: None,
+            plot_icon: None,
         }));
     }
     Ok(out)
@@ -710,6 +757,9 @@ fn instance_search(
                 label,
                 lock_level: parse_lock_level(lock_raw)?,
                 in_container: false,
+                legend_group: 0,
+                legend_text: None,
+                plot_icon: None,
             },
             instance_form_id: instance_id,
         });

@@ -213,7 +213,120 @@ fn fake_grouped(form_id: u32, editor_id: &str, space: Space) -> SearchResult {
         label: String::new(),
         lock_level: LockLevel::None,
         in_container: false,
+        legend_group: 0,
+        legend_text: None,
+        plot_icon: None,
     })
+}
+
+fn fake_stored(
+    form_id: u32,
+    editor_id: &str,
+    space: Space,
+    legend_group: i32,
+    legend_text: &str,
+    color: (u8, u8, u8),
+    base_icon_index: usize,
+) -> SearchResult {
+    SearchResult::Grouped(Grouped {
+        entity: Entity::new(
+            form_id,
+            editor_id,
+            "",
+            mappalachia_core::enums::Signature::Misc,
+            EntityKind::Standard,
+        ),
+        space,
+        count: 1,
+        spawn_weight: 1.0,
+        label: String::new(),
+        lock_level: LockLevel::None,
+        in_container: false,
+        legend_group,
+        legend_text: Some(legend_text.to_string()),
+        plot_icon: Some(mappalachia_core::search::StoredPlotIcon {
+            do_not_use_icon: Some(false),
+            base_icon_index: Some(base_icon_index),
+            size: Some(50),
+            color: Some(color),
+        }),
+    })
+}
+
+#[test]
+fn shared_legend_group_renders_same_icon_color() {
+    // Two items sharing a stored legend group keep the stored icon color
+    // (the CLI plots stored ItemsToPlot as-is); no assets or DB needed.
+    let plot = PlotSettings::default();
+    let space = Space::new(1, "T", "", false, false, 0.0, 0.0, 0.0, 0.0);
+    let items = prepare_items(
+        &plot,
+        7,
+        vec![
+            fake_stored(
+                1,
+                "Alpha2001",
+                space.clone(),
+                4,
+                "shared text",
+                (10, 20, 30),
+                2,
+            ),
+            fake_stored(
+                2,
+                "Beta2002",
+                space.clone(),
+                4,
+                "shared text",
+                (10, 20, 30),
+                2,
+            ),
+            fake_stored(
+                3,
+                "Gamma2003",
+                space.clone(),
+                5,
+                "other group",
+                (200, 10, 10),
+                2,
+            ),
+        ],
+    );
+    assert_eq!(items.len(), 3);
+    // Stored groups/text survive preparation.
+    assert_eq!(items[0].legend_group, 4);
+    assert_eq!(items[1].legend_group, 4);
+    assert_eq!(items[0].legend_text, "shared text");
+    // Same group -> the SAME icon color and base icon.
+    assert_eq!(items[0].icon.color, items[1].icon.color);
+    assert_eq!(items[0].icon.base_index, items[1].icon.base_index);
+    assert_eq!(items[0].icon.color.r, 10);
+    assert_eq!(items[0].icon.color.g, 20);
+    assert_eq!(items[0].icon.color.b, 30);
+    // A different group plots a different stored color.
+    assert_ne!(items[0].icon.color, items[2].icon.color);
+}
+
+#[test]
+fn missing_legend_fields_fall_back_to_fresh_assignment() {
+    // Minimal recipes (no stored legend data) keep the old behavior: each
+    // item gets its position group, computed legend text, and the FormMain
+    // palette math.
+    let plot = PlotSettings::default();
+    let space = Space::new(1, "T", "", false, false, 0.0, 0.0, 0.0, 0.0);
+    let items = prepare_items(
+        &plot,
+        7,
+        vec![
+            fake_grouped(1, "Alpha2001", space.clone()),
+            fake_grouped(2, "Beta2002", space.clone()),
+        ],
+    );
+    assert_eq!(items[0].legend_group, 0);
+    assert_eq!(items[1].legend_group, 1);
+    assert_eq!(items[0].legend_text, "Alpha2001");
+    assert_eq!(items[1].legend_text, "Beta2002");
+    assert_ne!(items[0].icon.color, items[1].icon.color);
 }
 
 #[test]
