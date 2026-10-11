@@ -634,7 +634,7 @@ fn recipe_round_trip() {
     assert_eq!(r.items_to_plot.len(), 1);
     let back = serde_json::to_string(&r).unwrap();
     let r2: Recipe = serde_json::from_str(&back).unwrap();
-    assert_eq!(r2.items_to_plot[0].count, 5);
+    assert_eq!(r2.items_to_plot[0].count(), 5);
 }
 #[test]
 fn legend_text_rules() {
