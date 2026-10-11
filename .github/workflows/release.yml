@@ -1,0 +1,49 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p mappalachia-cli -p mappalachia-egui
+      - run: Compress-Archive -Path target/release/mappalachia-cli.exe,target/release/mappalachia-egui.exe -Destination mappalachia-rs-windows.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: mappalachia-rs-windows.zip
+
+  appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev
+          libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          libwayland-dev libxkbcommon-x11-dev
+      - run: cargo build --release -p mappalachia-cli -p mappalachia-egui
+      - name: Package AppImage
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage appimagetool-x86_64.AppImage
+          mkdir -p AppDir/usr/bin
+          cp target/release/mappalachia-egui AppDir/usr/bin/
+          cp assets/mappalachia-rs.desktop AppDir/
+          cp assets/icon.png AppDir/mappalachia-rs.png
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --desktop-file AppDir/mappalachia-rs.desktop --icon-file AppDir/mappalachia-rs.png --output appimage
+          mv Mappalachia_RS-*.AppImage mappalachia-rs-x86_64.AppImage
+          cp target/release/mappalachia-cli mappalachia-cli-linux-x86_64
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mappalachia-rs-x86_64.AppImage
+            mappalachia-cli-linux-x86_64

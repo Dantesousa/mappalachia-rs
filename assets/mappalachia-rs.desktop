@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Mappalachia RS
+Comment=Fallout 76 mapping tool (Rust port)
+Exec=mappalachia-egui
+Icon=mappalachia-rs
+Terminal=false
+Type=Application
+Categories=Game;Utility;
+StartupWMClass=mappalachia-egui
