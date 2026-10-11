@@ -321,6 +321,7 @@ empty 4096 canvas (transparent, mirrors new Bitmap)
 → coord grid (Fine 40/Medium 20/Large 10 intervals; minor/major pens; edge labels; x-labels -90°)
 → infestations (fill (32,255,120,100) + edge (128,255,120,100) w4 + infestation SVG centered; centroid +(2048,-2048) per Map.cs:224)
 → map markers (icons at 1.5×, optional grayscale; labels below, shadowed iff no icons)
+NOTE: door + infestation SVGs are scale-1 in C# (Map.cs:804 default DoorIconScale=1; GetInfestationMarker scale=1) but `svg_marker` bakes 1.5× — downscale to 2/3 when drawing these two so output matches.
 → standard plots (items sorted by legend_group; skip other spaces; region/location/shape/icon branches; VolumeDrawMode Fill/Border/Both; region levels ≤/≥/range strings)
 → watermark (space name + instanced + grid range/center + game version + credit; transparent white, bottom, grid margin)
 → title (top, margin when grid)
