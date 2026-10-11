@@ -26,9 +26,11 @@
 //!   clustering pass) instead of the C# object back-pointer, which would be a
 //!   reference cycle in Rust. [`Cluster`] therefore takes an `id` in addition
 //!   to the C# `Cluster(origin)` parameter.
-//! - `Entity` equality in C# is `FormID + EditorID` only, and `Instance`
-//!   equality is `InstanceFormID` only; here equality is derived over all
-//!   fields (identical clones still compare equal).
+//! - C# `Entity.Equals` is `FormID + EditorID` only, `Instance.Equals` is
+//!   `InstanceFormID` only, and `Space` inherits `Entity` equality; the
+//!   manual `PartialEq`/`Eq`/`Hash` impls below mirror that exactly (so a
+//!   recipe-deserialized `Space` with `DisplayName ""` still equals the DB
+//!   `Space`, matching `PopulateFromData`).
 //! - `Region` min/max level are `#[serde(skip)]`, matching the C#
 //!   `[JsonIgnore]` attributes.
 
@@ -120,13 +122,31 @@ pub enum EntityKind {
 }
 
 /// Mirrors C# `Library.Entity`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// Equality mirrors C# `Entity.Equals`/`GetHashCode`: `form_id + editor_id`
+/// only (`display_name`, `signature`, `kind` are ignored).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Entity {
     pub form_id: u32,
     pub editor_id: String,
     pub display_name: String,
     pub signature: Signature,
     pub kind: EntityKind,
+}
+
+impl PartialEq for Entity {
+    fn eq(&self, other: &Self) -> bool {
+        self.form_id == other.form_id && self.editor_id == other.editor_id
+    }
+}
+
+impl Eq for Entity {}
+
+impl std::hash::Hash for Entity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.form_id.hash(state);
+        self.editor_id.hash(state);
+    }
 }
 
 impl Entity {
@@ -196,7 +216,10 @@ impl Entity {
 // ---------------------------------------------------------------------------
 
 /// Mirrors C# `Library.Space` (a Worldspace or a Cell space).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// Equality mirrors C#: `Space` does not override `Equals`, so it inherits
+/// `Entity` equality (`form_id + editor_id` only).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Space {
     pub entity: Entity,
     pub is_worldspace: bool,
@@ -205,6 +228,20 @@ pub struct Space {
     pub center_y: f64,
     pub max_range: f64,
     pub north_angle: f64,
+}
+
+impl PartialEq for Space {
+    fn eq(&self, other: &Self) -> bool {
+        self.entity == other.entity
+    }
+}
+
+impl Eq for Space {}
+
+impl std::hash::Hash for Space {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.entity.hash(state);
+    }
 }
 
 impl Space {
@@ -310,7 +347,10 @@ impl Space {
 // ---------------------------------------------------------------------------
 
 /// Mirrors C# `Library.Instance` (+ the shared `BaseInstance` fields).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// Equality mirrors C# `Instance.Equals`/`GetHashCode`: `instance_form_id`
+/// only (all other fields are ignored).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Instance {
     pub entity: Entity,
     pub space: Space,
@@ -369,6 +409,20 @@ impl Instance {
 
     pub fn is_member_of_cluster(&self) -> bool {
         self.cluster.is_some()
+    }
+}
+
+impl PartialEq for Instance {
+    fn eq(&self, other: &Self) -> bool {
+        self.instance_form_id == other.instance_form_id
+    }
+}
+
+impl Eq for Instance {}
+
+impl std::hash::Hash for Instance {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.instance_form_id.hash(state);
     }
 }
 
@@ -899,5 +953,120 @@ mod tests {
         assert!(test_space().is_appalachia());
         assert!(test_space().is_nukable());
         assert!(test_space().is_suitable_for_spotlight());
+    }
+
+    #[test]
+    fn entity_equality_is_form_id_plus_editor_id() {
+        let base = Entity::new(
+            0x94FC1,
+            "SomeEditor",
+            "Some Display",
+            Signature::Flora,
+            EntityKind::Standard,
+        );
+        // Different display_name/kind still equal.
+        let variant = Entity::new(
+            0x94FC1,
+            "SomeEditor",
+            "Other Display",
+            Signature::Npc,
+            EntityKind::DerivedNpc,
+        );
+        assert_eq!(base, variant);
+        // Different form_id unequal.
+        let other_form = Entity::new(
+            0x94FC2,
+            "SomeEditor",
+            "Some Display",
+            Signature::Flora,
+            EntityKind::Standard,
+        );
+        assert_ne!(base, other_form);
+        // Different editor_id unequal.
+        let other_editor = Entity::new(
+            0x94FC1,
+            "OtherEditor",
+            "Some Display",
+            Signature::Flora,
+            EntityKind::Standard,
+        );
+        assert_ne!(base, other_editor);
+    }
+
+    #[test]
+    fn instance_equality_is_instance_form_id_only() {
+        let space = test_space();
+        let entity = Entity::new(
+            0x94FC1,
+            "SomeEditor",
+            "Some Display",
+            Signature::Flora,
+            EntityKind::Standard,
+        );
+        let a = Instance::new(
+            entity.clone(),
+            space.clone(),
+            Coord::new(1.0, 2.0),
+            12345,
+            "Label A",
+            None,
+            LockLevel::None,
+            None,
+            1.0,
+            false,
+        );
+        // Different coords/label (and everything but the id) still equal.
+        let b = Instance::new(
+            Entity::new(
+                0xDEAD,
+                "Other",
+                "Other",
+                Signature::Npc,
+                EntityKind::DerivedNpc,
+            ),
+            space.clone(),
+            Coord::new_xyz(9.0, 8.0, 7.0),
+            12345,
+            "Label B",
+            None,
+            LockLevel::Level1,
+            None,
+            2.0,
+            true,
+        );
+        assert_eq!(a, b);
+        // Different instance_form_id unequal.
+        let c = Instance::new(
+            entity,
+            space,
+            Coord::new(1.0, 2.0),
+            54321,
+            "Label A",
+            None,
+            LockLevel::None,
+            None,
+            1.0,
+            false,
+        );
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn recipe_space_equals_db_appalachia() {
+        // Full DB Appalachia space vs the recipe-deserialized stub, whose
+        // DisplayName is "" (C# `[JsonIgnore]`).
+        let db = Space::new(
+            2480661,
+            "APPALACHIA",
+            "Appalachia",
+            true,
+            true,
+            0.0,
+            0.0,
+            100_000.0,
+            0.0,
+        );
+        let recipe = Space::new(2480661, "APPALACHIA", "", true, true, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(recipe, db);
     }
 }
