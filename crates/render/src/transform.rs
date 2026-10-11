@@ -11,13 +11,13 @@ impl View {
 fn half() -> f64 { MAP_IMAGE_RESOLUTION as f64 / 2.0 }
 
 /// Mirrors AsImagePoint: x = (wx-cx)/f + half; y = ((-wy+cy)/f) + half (Y flip).
-#[allow(clippy::neg_multiply)] // keep C# formula shape verbatim
 pub fn world_to_image(v: &View, x: f64, y: f64) -> (f32, f32) {
     (((x - v.center_x) / v.factor + half()) as f32,
      (((-y + v.center_y) / v.factor) + half()) as f32)
 }
 
 /// Mirrors AsWorldCoord (exact inverse).
+#[allow(clippy::neg_multiply)] // keep C# `* -1` formula shape verbatim
 pub fn image_to_world(v: &View, px: f32, py: f32) -> (f64, f64) {
     (((px as f64 - half()) * v.factor) + v.center_x,
      ((((py as f64 - half()) * v.factor) - v.center_y) * -1.0))
