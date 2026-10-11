@@ -341,10 +341,10 @@ impl App {
     /// (`FormMain.cs:1411-1435`, non-grouped path): for each checked result
     /// not already on the map, compute `legend_text(include_count = false)`
     /// (mirrors `GenerateLegendText`), fresh-assign a `PlotIcon` at the next
-    /// group with the default palette/size, stamp the group onto the result,
-    /// and push a `PlotItem`.
+    /// group with the current plot palette/size, stamp the group onto the
+    /// result, and push a `PlotItem`. Drops any stale preview.
     pub fn add_selected(&mut self) {
-        let style = PlotStyleSettings::default();
+        let style = self.plot_style.clone();
         let mut added = 0;
         for i in 0..self.results.len() {
             if !self.checked.get(i).copied().unwrap_or(false) {
@@ -381,6 +381,7 @@ impl App {
         }
         self.next_group = self.next_available_group();
         self.status = format!("Added {added} item(s); {} on map.", self.items.len());
+        self.invalidate_preview();
     }
 
     /// C# `FormMain.GetNextAvailableLegendGroup` (`FormMain.cs:1490-1498`):
@@ -422,6 +423,7 @@ impl App {
             self.items.len(),
             self.results.len()
         );
+        self.invalidate_preview();
     }
 
     /// Recommended filename stem for the current map (mirrors
@@ -576,7 +578,10 @@ impl App {
         // v1 has a single markers toggle driving both C# flags.
         self.show_markers = map.map_marker_icons || map.map_marker_labels;
         self.show_infestations = map.show_infestations;
-        self.plot_mode = plot.mode;
+        // Standard-locked until the modes plan: the v1 combo cannot
+        // represent the other modes, so clamp (a recipe saved elsewhere may
+        // store Topographic/Heatmap/Cluster, which `draw` would reject).
+        self.plot_mode = PlotMode::Standard;
         self.plot_style = plot.plot_style_settings.clone();
         let include_count = plot.include_count_in_legend;
         let style = self.plot_style.clone();
@@ -622,7 +627,55 @@ impl App {
         self.next_group = self.next_available_group();
         self.filename = self.recommended_filename();
         self.status = format!("Opened recipe ({} item(s)).", n);
+        self.invalidate_preview();
         Ok(())
+    }
+}
+
+/// Preview invalidation + settings fingerprint (stale-preview fixes).
+impl App {
+    /// Drop any rendered/stale preview: the panel must never show a map
+    /// that no longer matches state. Called after every mutation that
+    /// affects the render (items, opened recipe, settings edits).
+    fn invalidate_preview(&mut self) {
+        self.preview_rx = None;
+        self.preview = PreviewState::Idle;
+    }
+
+    /// Snapshot of every panel field that feeds [`App::draw_settings`].
+    /// The settings widgets write these fields directly (no setters to
+    /// hook), so `update` compares this across the panels and drops a
+    /// preview made stale by any settings edit.
+    fn settings_fingerprint(
+        &self,
+    ) -> (
+        usize,
+        BackgroundImageType,
+        f32,
+        String,
+        LegendStyle,
+        LegendHorizontalAlignment,
+        LegendVerticalAlignment,
+        CompassStyle,
+        bool,
+        bool,
+        bool,
+        PlotMode,
+    ) {
+        (
+            self.space_idx,
+            self.background,
+            self.brightness,
+            self.title.clone(),
+            self.legend_style,
+            self.legend_halign,
+            self.legend_valign,
+            self.compass,
+            self.show_grid,
+            self.show_markers,
+            self.show_infestations,
+            self.plot_mode,
+        )
     }
 }
 
@@ -777,6 +830,9 @@ impl Default for App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_preview(ctx);
+        // Snapshot before the panels: any settings edit below stales the
+        // preview (compared again after the settings panel).
+        let settings_before = self.settings_fingerprint();
         egui::SidePanel::left("search_panel")
             .resizable(true)
             .show(ctx, |ui| {
@@ -943,6 +999,12 @@ impl eframe::App for App {
                     }
                 });
             });
+
+        // Any settings edit above stales the preview. The widgets write the
+        // fields directly (no setters to hook), so diff the fingerprint.
+        if self.settings_fingerprint() != settings_before {
+            self.invalidate_preview();
+        }
 
         egui::TopBottomPanel::bottom("export_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1150,6 +1212,43 @@ mod tests {
         assert!(app.items.is_empty());
         assert_eq!(app.results.len(), n - 1);
         assert_eq!(app.checked.len(), n - 1);
+    }
+
+    #[test]
+    fn add_selected_resets_stale_preview_to_idle() {
+        let mut app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        let item = test_plot_item(&space, 0);
+        app.results = vec![item.result.clone()];
+        app.checked = vec![true];
+        app.preview = PreviewState::Rendering;
+        let (_tx, rx) = std::sync::mpsc::channel::<PreviewResult>();
+        app.preview_rx = Some(rx);
+        app.add_selected();
+        assert_eq!(app.items.len(), 1);
+        assert!(
+            matches!(app.preview, PreviewState::Idle),
+            "add must reset a stale preview to Idle"
+        );
+        assert!(app.preview_rx.is_none());
+    }
+
+    #[test]
+    fn remove_selected_resets_stale_preview_to_idle() {
+        let mut app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        let item = test_plot_item(&space, 0);
+        app.results = vec![item.result.clone()];
+        app.checked = vec![true];
+        app.items = vec![item];
+        app.preview = PreviewState::Failed("stale".to_string());
+        app.remove_selected();
+        assert!(app.items.is_empty());
+        assert!(
+            matches!(app.preview, PreviewState::Idle),
+            "remove must reset a stale preview to Idle"
+        );
+        assert!(app.preview_rx.is_none());
     }
 
     /// Task 3 RED: settings state mirroring the C# defaults
@@ -1398,22 +1497,81 @@ mod tests {
             return;
         };
         app.run_search().expect("search succeeds");
+        assert!(
+            app.results.len() >= 2,
+            "need 2+ rows to check post-open adds, got {}",
+            app.results.len()
+        );
         app.checked[0] = true;
         app.add_selected();
         assert_eq!(app.items.len(), 1);
         app.title = "Task5 Open".to_string();
+        // Non-default plot style: items added after opening this recipe
+        // must use the recipe palette/size, not the default.
+        app.plot_style.size = 30;
+        app.plot_style.palette[0] = Rgba::new(1, 2, 3, 255);
+        app.plot_style.palette[1] = Rgba::new(4, 5, 6, 255);
         let path = std::env::temp_dir().join("mappalachia-egui-task5-open.json");
         app.save_recipe_to(&path).expect("save succeeds");
         let db_path = app.db_path.clone();
         let spaces = app.spaces.clone();
         let mut fresh = App::from_parts(db_path, None, spaces);
+        // A stale preview must not survive opening a recipe.
+        fresh.preview = PreviewState::Failed("stale".to_string());
         fresh.open_recipe_from(&path).expect("open succeeds");
+        assert!(
+            matches!(fresh.preview, PreviewState::Idle),
+            "open must reset a stale preview to Idle"
+        );
+        assert!(fresh.preview_rx.is_none());
         assert_eq!(fresh.items.len(), 1);
         assert_eq!(fresh.title, "Task5 Open");
         assert_eq!(fresh.next_group, 1);
         assert_eq!(fresh.items[0].legend_group, 0);
         assert!(fresh.spaces[fresh.space_idx].is_appalachia());
         assert!(fresh.status.contains("Opened recipe"));
+        assert_eq!(fresh.plot_style.size, 30);
+        assert_eq!(fresh.plot_style.palette[0], Rgba::new(1, 2, 3, 255));
+        // A newly added item uses the recipe style, not the default.
+        fresh.results = app.results.clone();
+        fresh.checked = vec![false; fresh.results.len()];
+        fresh.checked[1] = true;
+        fresh.add_selected();
+        assert_eq!(fresh.items.len(), 2);
+        assert_eq!(fresh.items[1].legend_group, 1);
+        assert_eq!(fresh.items[1].icon.size, 30);
+        assert_eq!(fresh.items[1].icon.color, Rgba::new(4, 5, 6, 255));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_recipe_clamps_plot_mode_to_standard() {
+        let Some(mut app) = search_app() else {
+            eprintln!("SKIP: MAPPALACHIA_DB unset");
+            return;
+        };
+        app.run_search().expect("search succeeds");
+        app.checked[0] = true;
+        app.add_selected();
+        assert_eq!(app.items.len(), 1);
+        let path = std::env::temp_dir().join("mappalachia-egui-task5-mode.json");
+        app.save_recipe_to(&path).expect("save succeeds");
+        // Rewrite the stored mode to a mode the v1 combo cannot represent.
+        let raw = std::fs::read_to_string(&path).expect("recipe readable");
+        let mut value: serde_json::Value = serde_json::from_str(&raw).expect("recipe is JSON");
+        value["PlotSettings"]["Mode"] = serde_json::Value::String("Topographic".to_string());
+        std::fs::write(
+            &path,
+            serde_json::to_string(&value).expect("recipe serializes"),
+        )
+        .expect("recipe writable");
+        let mut fresh = App::from_parts(app.db_path.clone(), None, app.spaces.clone());
+        fresh.open_recipe_from(&path).expect("open succeeds");
+        assert_eq!(
+            fresh.plot_mode,
+            PlotMode::Standard,
+            "open must clamp plot_mode to Standard until the modes plan"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
