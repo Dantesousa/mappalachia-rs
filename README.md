@@ -14,8 +14,10 @@ Generates and exports maps of entities in the Fallout 76 game world.
 
 ## Run
 
-You need the release data (not shipped here): `mappalachia.db` + `img/` + `font/`
-from a Mappalachia release zip.
+You need game data (not shipped in git): download `mappalachia-rs-data.zip`
+from the [latest release](https://github.com/Dantesousa/mappalachia-rs/releases/latest)
+(`data/mappalachia.db` + `img/` + `font/`) and extract it next to the binaries —
+or point `MAPPALACHIA_DB` / `MAPPALACHIA_ASSETS` at any Mappalachia data tree.
 
 ```bash
 export MAPPALACHIA_DB=/path/to/mappalachia.db
