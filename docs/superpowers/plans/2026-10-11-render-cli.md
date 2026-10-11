@@ -12,7 +12,7 @@
 
 - Workspace root `/home/dante/Documents/mappalachia-rs/`, resolver 2, edition 2021.
 - Asset root env `MAPPALACHIA_ASSETS` = `/mnt/hd/mappalachia` (full release extract: `img/{wrld,cell,mapmarker,icon}`, `font/`, `data/`). Tests skip with message when unset/missing. Never write into it.
-- Test DB env `MAPPALACHIA_DB` (same skip pattern as core).
+- Test DB env `MAPPALACHIA_DB` (same skip pattern as core). MUST be the 2.0.5.2 DB at `/home/dante/Documents/mappalachia-data/data/mappalachia.db` (game 1.7.26.13, 205 spaces) — the DB under `/mnt/hd/mappalachia/data/` is an older release (1.7.25.39, 204 spaces) and breaks parity counts. `/mnt/hd/mappalachia` remains valid for `MAPPALACHIA_ASSETS` only.
 - Canvas is always 4096×4096 (`MAP_IMAGE_RESOLUTION`); Extended legend widens to 4096+585.
 - Draw order follows `Map.Draw` (`~/Documents/Mappalachia/Mappalachia/Map.cs` lines 122-209) exactly.
 - Same-value constants from `Map.cs` lines 53-100 (listed per task).
