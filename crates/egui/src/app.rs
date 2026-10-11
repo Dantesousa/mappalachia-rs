@@ -110,6 +110,9 @@ impl App {
             .clone()
             .ok_or_else(|| "MAPPALACHIA_DB is not set".to_string())?;
         let conn = db::open_readonly(&path).map_err(|e| format!("DB open failed: {e}"))?;
+        if self.spaces.is_empty() {
+            return Err("Space list is empty; cannot scope search".to_string());
+        }
         let params = self.search_params();
         let results = search(&conn, &params).map_err(|e| format!("Search failed: {e}"))?;
         let n = results.len();
