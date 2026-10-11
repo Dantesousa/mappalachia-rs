@@ -134,8 +134,19 @@ pub struct DrawSettings {
 
 impl App {
     pub fn new() -> Self {
-        let db_path = std::env::var("MAPPALACHIA_DB").ok();
-        let assets_root = std::env::var("MAPPALACHIA_ASSETS").ok();
+        let (db_path, assets_root) = match (
+            std::env::var("MAPPALACHIA_DB").ok(),
+            std::env::var("MAPPALACHIA_ASSETS").ok(),
+        ) {
+            (Some(db), Some(assets)) => (Some(db), Some(assets)),
+            _ => match mappalachia_render::assets::exe_adjacent() {
+                Some((db, assets)) => (
+                    Some(db.to_string_lossy().into_owned()),
+                    Some(assets.to_string_lossy().into_owned()),
+                ),
+                None => (None, None),
+            },
+        };
         let spaces = match &db_path {
             Some(path) => db::open_readonly(path)
                 .and_then(|conn| db::all_spaces(&conn))
@@ -160,7 +171,7 @@ impl App {
         let status = if missing.is_empty() {
             "Ready.".to_string()
         } else {
-            format!("Missing env: {}. Set and restart.", missing.join(", "))
+            format!("Missing env: {}. Set and restart, or place data/ img/ font/ next to the executable.", missing.join(", "))
         };
         let space_idx = spaces.iter().position(|s| s.is_appalachia()).unwrap_or(0);
         let filename = recommended_stem("", spaces.get(space_idx));

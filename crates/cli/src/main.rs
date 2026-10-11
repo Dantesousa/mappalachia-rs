@@ -119,12 +119,24 @@ fn run_recipe(
 
 fn main() {
     let args = Args::parse();
-    let db_path = std::env::var("MAPPALACHIA_DB").unwrap_or_default();
-    let assets_root = std::env::var("MAPPALACHIA_ASSETS").unwrap_or_default();
-    if db_path.is_empty() || assets_root.is_empty() {
-        eprintln!("error: set MAPPALACHIA_DB and MAPPALACHIA_ASSETS");
-        std::process::exit(1);
-    }
+    let (db_path, assets_root) = match (
+        std::env::var("MAPPALACHIA_DB").ok(),
+        std::env::var("MAPPALACHIA_ASSETS").ok(),
+    ) {
+        (Some(db), Some(assets)) => (db, assets),
+        _ => match mappalachia_render::assets::exe_adjacent() {
+            Some((db, assets)) => (
+                db.to_string_lossy().into_owned(),
+                assets.to_string_lossy().into_owned(),
+            ),
+            None => {
+                eprintln!(
+                    "error: set MAPPALACHIA_DB and MAPPALACHIA_ASSETS, or place data/ img/ font/ next to the executable"
+                );
+                std::process::exit(1);
+            }
+        },
+    };
     let conn = match db::open_readonly(&db_path) {
         Ok(c) => c,
         Err(e) => {

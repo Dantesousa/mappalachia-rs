@@ -31,10 +31,26 @@ pub enum BackgroundKind {
     None,
 }
 
+/// Detect the release layout next to the current executable:
+/// `<exe>/data/mappalachia.db` + `<exe>/img` + `<exe>/font`.
+/// Returns `(db_path, assets_root)` when all three exist.
+pub fn exe_adjacent() -> Option<(PathBuf, PathBuf)> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let db = dir.join("data/mappalachia.db");
+    if !db.is_file() || !dir.join("img").is_dir() || !dir.join("font").is_dir() {
+        return None;
+    }
+    Some((db, dir))
+}
+
 /// Asset root handle with raster-image and SVG caches.
 ///
 /// Mirrors the static caches on C# `FileIO` (`BackgroundImageCache`,
 /// `MapMarkerIconImageCache`, `PlotIconImageCache`).
+///
+/// Layout note: the original app ships data next to the executable
+/// (`data/mappalachia.db`, `img/`, `font/`). [`exe_adjacent`] detects
+/// exactly that layout so release binaries run with no env configuration.
 pub struct Assets {
     root: PathBuf,
     cache: HashMap<String, image::RgbaImage>,
