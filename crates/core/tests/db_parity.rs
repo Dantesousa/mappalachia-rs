@@ -116,3 +116,26 @@ fn search_region_and_location() {
             .any(|x| x.editor_id() == "LocForestFlatwoodsLocation")
     );
 }
+
+#[test]
+fn resolve_nuka_instances() {
+    let Some(c) = conn() else { return };
+    let r = search(&c, &all_params("Nuka Cola")).unwrap();
+    let g = r.iter().find(|x| matches!(x, SearchResult::Grouped(_))).unwrap().clone();
+    let space = g.space().clone();
+    let inst = mappalachia_core::instances::instances(&c, g, &space).unwrap();
+    assert!(!inst.is_empty());
+    assert!(inst.iter().all(|i| i.space.form_id() == space.form_id()));
+}
+#[test]
+fn teleporters_and_zrange() {
+    let Some(c) = conn() else { return };
+    let spaces = mappalachia_core::db::all_spaces(&c).unwrap();
+    let app = spaces.iter().find(|s| s.editor_id() == "APPALACHIA").unwrap();
+    let t = mappalachia_core::instances::teleporters(&c, app).unwrap();
+    assert!(!t.is_empty());
+    let r = search(&c, &all_params("Nuka Cola")).unwrap();
+    let grouped: Vec<_> = r.into_iter().filter(|x| matches!(x, SearchResult::Grouped(_))).take(3).collect();
+    let (lo, hi) = mappalachia_core::instances::z_range(&c, &grouped, app).unwrap();
+    assert!(hi >= lo);
+}
