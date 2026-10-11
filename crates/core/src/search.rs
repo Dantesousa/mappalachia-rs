@@ -64,7 +64,10 @@ pub struct Grouped {
 #[derive(Debug, Clone)]
 pub enum SearchResult {
     Grouped(Grouped),
-    Singular { inner: Grouped, instance_form_id: u32 },
+    Singular {
+        inner: Grouped,
+        instance_form_id: u32,
+    },
 }
 
 impl SearchResult {
@@ -148,11 +151,7 @@ fn parse_lock_level(raw: Option<String>) -> Result<LockLevel> {
         Some(s) => {
             let stripped: String = s.chars().filter(|c| !c.is_whitespace()).collect();
             LockLevel::from_str(&stripped).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    e.into(),
-                )
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
             })
         }
     }
@@ -774,9 +773,7 @@ pub fn search(conn: &Connection, params: &SearchParams) -> Result<Vec<SearchResu
     )?);
     out.extend(instance_search(conn, &term, search_for_form_id, &spaces)?);
     if params.search_in_instances_only {
-        out.retain(|r| {
-            matches!(r, SearchResult::Singular { .. }) || r.space().is_instanceable
-        });
+        out.retain(|r| matches!(r, SearchResult::Singular { .. }) || r.space().is_instanceable);
     }
     Ok(out)
 }

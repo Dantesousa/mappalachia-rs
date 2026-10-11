@@ -53,9 +53,8 @@ pub fn all_spaces(c: &Connection) -> Result<Vec<Space>> {
 /// Mirrors C# `Database.GetMapMarkersForSpace`
 /// (`SELECT * FROM MapMarker WHERE SpaceFormID = … ORDER BY Y`).
 pub fn map_markers_for_space(c: &Connection, space_form_id: u32) -> Result<Vec<MapMarker>> {
-    let mut s = c.prepare(
-        "SELECT x, y, label, icon FROM MapMarker WHERE spaceFormID = ? ORDER BY y",
-    )?;
+    let mut s =
+        c.prepare("SELECT x, y, label, icon FROM MapMarker WHERE spaceFormID = ? ORDER BY y")?;
     let rows = s.query_map([space_form_id], |r| {
         Ok(MapMarker::new(
             r.get::<_, String>(3)?,
