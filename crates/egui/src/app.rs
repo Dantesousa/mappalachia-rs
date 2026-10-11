@@ -1,8 +1,11 @@
+use std::path::{Path, PathBuf};
+
 use mappalachia_core::{
     common::MAP_IMAGE_RESOLUTION,
     db,
     enums::{LockLevel, Signature},
     model::{EntityKind, Space},
+    recipe::{load_recipe_file, MapSettingsStub, PlotSettingsStub, Recipe},
     search::{search, Grouped, SearchParams, SearchResult},
 };
 use mappalachia_render::{
@@ -11,8 +14,9 @@ use mappalachia_render::{
     draw::{draw, DrawInput, Plottable},
     icon::PlotIcon,
     settings::{
-        BackgroundImageType, CompassStyle, LegendHorizontalAlignment, LegendStyle,
-        LegendVerticalAlignment, MapSettings, PlotMode, PlotSettings, PlotStyleSettings,
+        map_from_value, plot_from_value, BackgroundImageType, CompassStyle,
+        LegendHorizontalAlignment, LegendStyle, LegendVerticalAlignment, MapSettings, PlotMode,
+        PlotSettings, PlotStyleSettings,
     },
 };
 
@@ -47,8 +51,8 @@ pub struct App {
     pub checked: Vec<bool>,
     /// Items-to-plot.
     pub items: Vec<PlotItem>,
-    /// Next fresh legend group for `add_selected` (non-grouped path: one
-    /// fresh group per added item).
+    /// Cache of [`App::next_available_group`] (C# max+1 semantics),
+    /// refreshed after every items mutation.
     pub next_group: usize,
     /// Map background (`MapSettings.BackgroundImage`; C# default `Menu`).
     pub background: BackgroundImageType,
@@ -57,6 +61,11 @@ pub struct App {
     pub brightness: f32,
     /// Map title (`MapSettings.Title`; C# default `""`).
     pub title: String,
+    /// Export/recipe filename stem (no extension), editable in the bottom
+    /// panel. Defaults to the recommended name (title, else
+    /// `Mappalachia Map of {space}`), sanitized like
+    /// `FileIO.GetRecommendedMapFileName`.
+    pub filename: String,
     /// Legend style/alignments (C# defaults Compact/Right/Center).
     pub legend_style: LegendStyle,
     pub legend_halign: LegendHorizontalAlignment,
@@ -147,6 +156,7 @@ impl App {
             format!("Missing env: {}. Set and restart.", missing.join(", "))
         };
         let space_idx = spaces.iter().position(|s| s.is_appalachia()).unwrap_or(0);
+        let filename = recommended_stem("", spaces.get(space_idx));
         Self {
             db_path,
             assets_root,
@@ -161,6 +171,7 @@ impl App {
             background: BackgroundImageType::Menu,
             brightness: 0.5,
             title: String::new(),
+            filename,
             legend_style: LegendStyle::Compact,
             legend_halign: LegendHorizontalAlignment::Right,
             legend_valign: LegendVerticalAlignment::Center,
@@ -265,7 +276,10 @@ impl App {
                 let side = MAP_IMAGE_RESOLUTION as usize;
                 if bytes.len() != side * side * 4 {
                     self.preview = PreviewState::Failed(format!(
-                        "Preview bytes corrupt ({} != {}).", bytes.len(), side * side * 4));
+                        "Preview bytes corrupt ({} != {}).",
+                        bytes.len(),
+                        side * side * 4
+                    ));
                     self.status = "Preview bytes corrupt.".to_string();
                     return;
                 }
@@ -342,8 +356,9 @@ impl App {
             }
             let legend = result_legend_text(&self.results[i]);
             let no_icon = is_region_or_location(&self.results[i]);
-            let group = self.next_group;
-            self.next_group += 1;
+            // C# non-grouped path calls `GetNextAvailableLegendGroup()`
+            // per item, so groups stay dense after removals.
+            let group = self.next_available_group();
             let icon = PlotIcon::assign(
                 group,
                 &style.palette,
@@ -364,7 +379,21 @@ impl App {
             });
             added += 1;
         }
+        self.next_group = self.next_available_group();
         self.status = format!("Added {added} item(s); {} on map.", self.items.len());
+    }
+
+    /// C# `FormMain.GetNextAvailableLegendGroup` (`FormMain.cs:1490-1498`):
+    /// max assigned group + 1 (0 when empty), so removing the highest
+    /// group frees it for reuse. `next_group` is a cache of this value,
+    /// refreshed after every mutation — not a monotonic counter.
+    pub fn next_available_group(&self) -> usize {
+        self.items
+            .iter()
+            .map(|it| it.legend_group)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0)
     }
 
     /// Mirrors `FormMain.ButtonRemoveFromMap_Click`: drops every checked
@@ -387,12 +416,264 @@ impl App {
         }
         self.results = results;
         self.checked = checked;
+        self.next_group = self.next_available_group();
         self.status = format!(
             "{} item(s) on map; {} result(s).",
             self.items.len(),
             self.results.len()
         );
     }
+
+    /// Recommended filename stem for the current map (mirrors
+    /// `FileIO.GetRecommendedMapFileName`): the sanitized title, else
+    /// `Mappalachia Map of {space DisplayName}`, sanitized.
+    pub fn recommended_filename(&self) -> String {
+        recommended_stem(&self.title, self.spaces.get(self.space_idx))
+    }
+
+    /// Filename stem for export/recipe files: the sanitized `filename`
+    /// field, falling back to the recommended default when blank.
+    pub fn effective_stem(&self) -> String {
+        let clean = sanitize_filename(&self.filename);
+        if clean.is_empty() {
+            self.recommended_filename()
+        } else {
+            clean
+        }
+    }
+
+    /// Mirrors `FileIO.GetImageFileTypeRecommendation` for the current UI
+    /// state: JPEG for a worldspace with a background image, else PNG.
+    /// `false` when no spaces are loaded (`export_map` then fails).
+    pub fn export_uses_jpeg(&self) -> bool {
+        match self.spaces.get(self.space_idx) {
+            Some(space) => recommend_jpeg(space, self.background),
+            None => false,
+        }
+    }
+
+    /// Fixed output path (no file dialogs in v1 — `rfd` is OUT):
+    /// `./<stem>.<ext>` in the process working directory.
+    pub fn export_path(&self) -> PathBuf {
+        let ext = if self.export_uses_jpeg() {
+            "jpg"
+        } else {
+            "png"
+        };
+        PathBuf::from(format!("./{}.{}", self.effective_stem(), ext))
+    }
+
+    /// Fixed recipe path (no dialogs in v1): `./<stem>.json`, sharing the
+    /// export stem so one filename field drives both.
+    pub fn recipe_path(&self) -> PathBuf {
+        PathBuf::from(format!("./{}.json", self.effective_stem()))
+    }
+
+    /// Render the current map synchronously and save it at
+    /// [`App::export_path`], reusing the preview worker body
+    /// ([`render_preview_bytes`]) for the pixels. v1 blocks the UI thread
+    /// (a 4096² render takes seconds); a threaded export is a later-task
+    /// option. Reports via `status`.
+    pub fn export_map(&mut self) -> Result<PathBuf, String> {
+        let settings = self
+            .draw_settings()
+            .ok_or_else(|| "Cannot export: no spaces loaded.".to_string())?;
+        let (db_path, assets_root) = match (self.db_path.clone(), self.assets_root.clone()) {
+            (Some(d), Some(a)) => (d, a),
+            _ => {
+                return Err(
+                    "Cannot export: MAPPALACHIA_DB / MAPPALACHIA_ASSETS not set.".to_string(),
+                );
+            }
+        };
+        let bytes = render_preview_bytes(&db_path, &assets_root, settings, self.items.clone())?;
+        let side = MAP_IMAGE_RESOLUTION as u32;
+        let rgba = image::RgbaImage::from_raw(side, side, bytes)
+            .ok_or_else(|| "Export bytes corrupt.".to_string())?;
+        let path = self.export_path();
+        if self.export_uses_jpeg() {
+            // JPEG has no alpha: flatten over black like the CLI exporter.
+            let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+            for (x, y, px) in rgba.enumerate_pixels() {
+                let a = f32::from(px[3]) / 255.0;
+                rgb.put_pixel(
+                    x,
+                    y,
+                    image::Rgb([
+                        (f32::from(px[0]) * a).round() as u8,
+                        (f32::from(px[1]) * a).round() as u8,
+                        (f32::from(px[2]) * a).round() as u8,
+                    ]),
+                );
+            }
+            rgb.save(&path).map_err(|e| e.to_string())?;
+        } else {
+            rgba.save(&path).map_err(|e| e.to_string())?;
+        }
+        self.status = format!("Exported {}.", path.display());
+        Ok(path)
+    }
+
+    /// Save the current map as a recipe at `path` (mirrors
+    /// `FormMain.Map_SaveAsRecipe_Click` minus the dialog): the current
+    /// full-DB space, the typed settings serialized to the PascalCase
+    /// stubs, and the items with their groups + legend text stamped
+    /// (icons stay fresh-assigned on open, so no `PlotIcon` is stored).
+    pub fn save_recipe_to(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        let settings = self
+            .draw_settings()
+            .ok_or_else(|| "Cannot save recipe: no spaces loaded.".to_string())?;
+        let map_value = serde_json::to_value(&settings.map).map_err(|e| e.to_string())?;
+        let plot_value = serde_json::to_value(&settings.plot).map_err(|e| e.to_string())?;
+        Recipe {
+            space: settings.space,
+            map_settings: MapSettingsStub::from(map_value),
+            plot_settings: PlotSettingsStub::from(plot_value),
+            items_to_plot: self.items.iter().map(plot_item_to_result).collect(),
+        }
+        .save_to_file(path)
+    }
+
+    /// Open a recipe file (mirrors `FormMain.Map_OpenRecipe_Click` +
+    /// `Recipe.AsSettings`): resolve the recipe space and every item space
+    /// via `populate_from_data`, apply the typed map/plot settings to the
+    /// panels, and rebuild the items with fresh icons at their stored
+    /// groups (like the C# CLI path, which plots stored groups with
+    /// re-derived icons). Resets `next_group` and `filename` to the opened
+    /// map. Reports via `status`.
+    pub fn open_recipe_from(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        let recipe = load_recipe_file(&path)?;
+        let db_path = self
+            .db_path
+            .clone()
+            .ok_or_else(|| "MAPPALACHIA_DB is not set".to_string())?;
+        let conn = db::open_readonly(&db_path).map_err(|e| format!("DB open failed: {e}"))?;
+        let space = db::populate_from_data(&conn, &recipe.space).map_err(|e| {
+            format!(
+                "recipe space {} not in database: {e}",
+                recipe.space.editor_id()
+            )
+        })?;
+        let map = map_from_value(recipe.map_settings.raw())
+            .map_err(|e| format!("recipe map settings: {e}"))?;
+        let plot = plot_from_value(recipe.plot_settings.raw())
+            .map_err(|e| format!("recipe plot settings: {e}"))?;
+        match self.spaces.iter().position(|s| *s == space) {
+            Some(i) => self.space_idx = i,
+            None => {
+                self.spaces.push(space);
+                self.space_idx = self.spaces.len() - 1;
+            }
+        }
+        self.background = map.background_image;
+        self.brightness = map.brightness;
+        self.title = map.title.clone();
+        self.legend_style = map.legend_style;
+        self.legend_halign = map.legend_horizontal_alignment;
+        self.legend_valign = map.legend_vertical_alignment;
+        self.compass = map.compass_style;
+        self.show_grid = map.show_coordinate_grid;
+        // v1 has a single markers toggle driving both C# flags.
+        self.show_markers = map.map_marker_icons || map.map_marker_labels;
+        self.show_infestations = map.show_infestations;
+        self.plot_mode = plot.mode;
+        self.plot_style = plot.plot_style_settings.clone();
+        let include_count = plot.include_count_in_legend;
+        let style = self.plot_style.clone();
+        let mut items = Vec::with_capacity(recipe.items_to_plot.len());
+        for result in recipe.items_to_plot {
+            let resolved = db::populate_from_data(&conn, result.space()).map_err(|e| {
+                format!(
+                    "item space {} not in database: {e}",
+                    result.space().editor_id()
+                )
+            })?;
+            let mut owned = result;
+            match &mut owned {
+                SearchResult::Grouped(g) => g.space = resolved,
+                SearchResult::Singular { inner, .. } => inner.space = resolved,
+            }
+            let group = grouped_of(&owned).legend_group.max(0) as usize;
+            let legend = grouped_of(&owned)
+                .legend_text
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| grouped_of(&owned).legend_text(include_count));
+            match &mut owned {
+                SearchResult::Grouped(g) => g.legend_text = Some(legend.clone()),
+                SearchResult::Singular { inner, .. } => inner.legend_text = Some(legend.clone()),
+            }
+            let icon = PlotIcon::assign(
+                group,
+                &style.palette,
+                style.size as u32,
+                is_region_or_location(&owned),
+                PLOT_ICON_COUNT,
+            );
+            items.push(PlotItem {
+                result: owned,
+                legend_group: group,
+                icon,
+                legend,
+            });
+        }
+        let n = items.len();
+        self.items = items;
+        self.next_group = self.next_available_group();
+        self.filename = self.recommended_filename();
+        self.status = format!("Opened recipe ({} item(s)).", n);
+        Ok(())
+    }
+}
+
+/// Mirrors `FileIO.SanitizeForFileName` (plus the Windows invalid-char set
+/// so recipes stay portable): strip invalid filename chars, trim
+/// whitespace, drop trailing periods.
+pub fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\0'
+            ) && !c.is_control()
+        })
+        .collect::<String>()
+        .trim()
+        .trim_end_matches('.')
+        .to_string()
+}
+
+/// Filename-stem counterpart of [`App::recommended_filename`], usable
+/// before an [`App`] exists (e.g. in `from_parts`).
+fn recommended_stem(title: &str, space: Option<&Space>) -> String {
+    let clean = sanitize_filename(title);
+    if !clean.is_empty() {
+        return clean;
+    }
+    match space {
+        Some(s) => sanitize_filename(&format!("Mappalachia Map of {}", s.display_name())),
+        None => "Mappalachia Map".to_string(),
+    }
+}
+
+/// Mirrors `FileIO.GetImageFileTypeRecommendation`: JPEG for a worldspace
+/// with a background image, PNG otherwise (cell spaces and
+/// `BackgroundImageType::None` always PNG).
+pub fn recommend_jpeg(space: &Space, background: BackgroundImageType) -> bool {
+    space.is_worldspace && background != BackgroundImageType::None
+}
+
+/// Convert an items-to-plot entry back to a recipe `SearchResult`,
+/// stamping the assigned group + legend text.
+fn plot_item_to_result(item: &PlotItem) -> SearchResult {
+    let mut result = item.result.clone();
+    let grouped = match &mut result {
+        SearchResult::Grouped(g) => g,
+        SearchResult::Singular { inner, .. } => inner,
+    };
+    grouped.legend_group = item.legend_group as i32;
+    grouped.legend_text = Some(item.legend.clone());
+    result
 }
 
 /// Run the Standard render off-thread: open the DB + assets on the worker,
@@ -663,9 +944,34 @@ impl eframe::App for App {
                 });
             });
 
+        egui::TopBottomPanel::bottom("export_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Filename:");
+                ui.text_edit_singleline(&mut self.filename);
+                if ui.button("Export").clicked() {
+                    if let Err(e) = self.export_map() {
+                        self.status = e;
+                    }
+                }
+                if ui.button("Save Recipe").clicked() {
+                    let path = self.recipe_path();
+                    match self.save_recipe_to(&path) {
+                        Ok(()) => self.status = format!("Saved recipe {}.", path.display()),
+                        Err(e) => self.status = e,
+                    }
+                }
+                if ui.button("Open Recipe").clicked() {
+                    let path = self.recipe_path();
+                    if let Err(e) = self.open_recipe_from(&path) {
+                        self.status = e;
+                    }
+                }
+            });
+            ui.label(&self.status);
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Mappalachia RS");
-            ui.label(&self.status);
             ui.label(format!(
                 "DB: {}",
                 self.db_path.as_deref().unwrap_or("(not set)")
@@ -712,7 +1018,6 @@ impl eframe::App for App {
                     ui.label(format!("Preview failed: {e}"));
                 }
             }
-            ui.label("Export panel (Task 5): pending");
         });
     }
 }
@@ -982,5 +1287,151 @@ mod tests {
         app.start_preview();
         assert!(matches!(app.preview, PreviewState::Failed(_)));
         assert!(app.preview_rx.is_none());
+    }
+
+    /// Task 5 RED: export filename/format/recipe behaviours.
+    use mappalachia_core::model::Entity;
+    use mappalachia_core::recipe::load_recipe_file;
+
+    /// Minimal items-to-plot entry for DB-free Task 5 tests.
+    fn test_plot_item(space: &Space, group: usize) -> PlotItem {
+        let entity = Entity::new(
+            0x1000 + group as u32,
+            format!("EDID{group}"),
+            "Display".to_string(),
+            Signature::Misc,
+            EntityKind::Standard,
+        );
+        let grouped = Grouped {
+            entity,
+            space: space.clone(),
+            count: 1,
+            spawn_weight: 1.0,
+            label: String::new(),
+            lock_level: LockLevel::None,
+            in_container: false,
+            legend_group: group as i32,
+            legend_text: None,
+            plot_icon: None,
+        };
+        let style = PlotStyleSettings::default();
+        PlotItem {
+            result: SearchResult::Grouped(grouped),
+            legend_group: group,
+            icon: PlotIcon::assign(
+                group,
+                &style.palette,
+                style.size as u32,
+                false,
+                PLOT_ICON_COUNT,
+            ),
+            legend: format!("EDID{group}"),
+        }
+    }
+
+    #[test]
+    fn format_rule_jpeg_for_appalachia_render() {
+        let mut app = settings_app();
+        app.background = BackgroundImageType::Render;
+        let space = app.spaces[app.space_idx].clone();
+        assert!(space.is_worldspace);
+        assert!(recommend_jpeg(&space, app.background));
+    }
+
+    #[test]
+    fn format_rule_png_for_cell_space_or_no_background() {
+        let cell = Space::new(
+            0x0000_0010,
+            "CELL0001",
+            "Test Cell",
+            false,
+            false,
+            0.0,
+            0.0,
+            1000.0,
+            0.0,
+        );
+        assert!(!recommend_jpeg(&cell, BackgroundImageType::Render));
+        let mut app = settings_app();
+        app.background = BackgroundImageType::None;
+        let space = app.spaces[app.space_idx].clone();
+        assert!(space.is_worldspace);
+        assert!(!recommend_jpeg(&space, app.background));
+    }
+
+    #[test]
+    fn sanitize_strips_slash_and_trims() {
+        assert_eq!(sanitize_filename("  a/b  "), "ab");
+        assert_eq!(
+            sanitize_filename("Mappalachia Map of Appalachia"),
+            "Mappalachia Map of Appalachia"
+        );
+        assert_eq!(sanitize_filename("map."), "map");
+    }
+
+    #[test]
+    fn recommended_filename_falls_back_to_space() {
+        let app = settings_app();
+        assert_eq!(app.filename, "Mappalachia Map of Appalachia");
+        let mut titled = settings_app();
+        titled.title = "  Nuka/map  ".to_string();
+        assert_eq!(titled.recommended_filename(), "Nukamap");
+    }
+
+    #[test]
+    fn recipe_save_load_round_trip_preserves_items() {
+        let mut app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        app.items.push(test_plot_item(&space, 0));
+        app.items.push(test_plot_item(&space, 1));
+        let path = std::env::temp_dir().join("mappalachia-egui-task5-recipe.json");
+        app.save_recipe_to(&path).expect("save succeeds");
+        let recipe = load_recipe_file(&path).expect("load succeeds");
+        assert_eq!(recipe.items_to_plot.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_recipe_round_trip_restores_items_and_settings() {
+        let Some(mut app) = search_app() else {
+            eprintln!("SKIP: MAPPALACHIA_DB unset");
+            return;
+        };
+        app.run_search().expect("search succeeds");
+        app.checked[0] = true;
+        app.add_selected();
+        assert_eq!(app.items.len(), 1);
+        app.title = "Task5 Open".to_string();
+        let path = std::env::temp_dir().join("mappalachia-egui-task5-open.json");
+        app.save_recipe_to(&path).expect("save succeeds");
+        let db_path = app.db_path.clone();
+        let spaces = app.spaces.clone();
+        let mut fresh = App::from_parts(db_path, None, spaces);
+        fresh.open_recipe_from(&path).expect("open succeeds");
+        assert_eq!(fresh.items.len(), 1);
+        assert_eq!(fresh.title, "Task5 Open");
+        assert_eq!(fresh.next_group, 1);
+        assert_eq!(fresh.items[0].legend_group, 0);
+        assert!(fresh.spaces[fresh.space_idx].is_appalachia());
+        assert!(fresh.status.contains("Opened recipe"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_selected_recomputes_next_group_like_csharp() {
+        // C# `GetNextAvailableLegendGroup` is max+1, so removing the
+        // highest group frees it for reuse (monotonic would keep 2).
+        let mut app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        let item0 = test_plot_item(&space, 0);
+        let item1 = test_plot_item(&space, 1);
+        app.results = vec![item0.result.clone(), item1.result.clone()];
+        app.checked = vec![false, true];
+        app.items = vec![item0, item1];
+        app.next_group = 2;
+        app.remove_selected();
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.next_group, 1);
     }
 }

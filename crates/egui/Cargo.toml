@@ -9,3 +9,5 @@ mappalachia-render = { path = "../render" }
 eframe = "0.32"
 egui = "0.32"
 tiny-skia = "0.11"
+image = "0.25"
+serde_json = "1"

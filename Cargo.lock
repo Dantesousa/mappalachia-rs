@@ -2184,8 +2184,10 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "image",
  "mappalachia-core",
  "mappalachia-render",
+ "serde_json",
  "tiny-skia",
 ]
 
