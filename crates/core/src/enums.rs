@@ -273,7 +273,7 @@ impl Signature {
     }
 
     /// Default selected signatures (used by Task 5 tests).
-    /// Exact list per C# IsRecommendedSelection (ACTI first); Task 2 brief omitted Acti by error.
+    /// Same set as C# IsRecommendedSelection (ACTI included); order follows the Task 2 brief.
     pub fn recommended_default() -> Vec<Signature> {
         [
             Signature::Acti,
