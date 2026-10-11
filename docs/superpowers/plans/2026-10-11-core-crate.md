@@ -331,8 +331,8 @@ fn meta_and_spaces() {
     assert_eq!(db::game_version(&c).unwrap(), "1.7.26.13");
     let spaces = db::all_spaces(&c).unwrap();
     assert_eq!(spaces.len(), 205);
-    let app = spaces.iter().find(|s| s.editor_id == "APPALACHIA").unwrap();
-    assert_eq!(app.form_id, 2480661);
+    let app = spaces.iter().find(|s| s.editor_id() == "APPALACHIA").unwrap();
+    assert_eq!(app.form_id(), 2480661);
 }
 #[test]
 fn markers_and_globals() {
@@ -565,13 +565,13 @@ fn resolve_nuka_instances() {
     let space = g.space().clone();
     let inst = mappalachia_core::instances::instances(&c, g, &space).unwrap();
     assert!(!inst.is_empty());
-    assert!(inst.iter().all(|i| i.space.form_id == space.form_id));
+    assert!(inst.iter().all(|i| i.space.form_id() == space.form_id()));
 }
 #[test]
 fn teleporters_and_zrange() {
     let Some(c) = conn() else { return };
     let spaces = mappalachia_core::db::all_spaces(&c).unwrap();
-    let app = spaces.iter().find(|s| s.editor_id == "APPALACHIA").unwrap();
+    let app = spaces.iter().find(|s| s.editor_id() == "APPALACHIA").unwrap();
     let t = mappalachia_core::instances::teleporters(&c, app).unwrap();
     assert!(!t.is_empty());
     let r = search(&c, &all_params("Nuka Cola")).unwrap();
@@ -629,7 +629,7 @@ fn recipe_round_trip() {
 "Space":{"FormID":2480661,"EditorID":"APPALACHIA","DisplayName":"Appalachia","Signature":"WRLD"},
 "Count":5,"SpawnWeight":1.0,"Label":"","LockLevel":"None","InContainer":false}]}"#;
     let r: Recipe = serde_json::from_str(json).unwrap();
-    assert_eq!(r.space.editor_id, "APPALACHIA");
+    assert_eq!(r.space.editor_id(), "APPALACHIA");
     assert_eq!(r.items_to_plot.len(), 1);
     let back = serde_json::to_string(&r).unwrap();
     let r2: Recipe = serde_json::from_str(&back).unwrap();

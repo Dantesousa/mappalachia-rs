@@ -245,6 +245,19 @@ impl std::hash::Hash for Space {
 }
 
 impl Space {
+    /// C# inherited `Entity.FormID`.
+    pub fn form_id(&self) -> u32 {
+        self.entity.form_id
+    }
+    /// C# inherited `Entity.EditorID`.
+    pub fn editor_id(&self) -> &str {
+        &self.entity.editor_id
+    }
+    /// C# inherited `Entity.DisplayName`.
+    pub fn display_name(&self) -> &str {
+        &self.entity.display_name
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         form_id: u32,
