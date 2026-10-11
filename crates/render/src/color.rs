@@ -9,7 +9,7 @@ pub fn lerp(x: Rgba, y: Rgba, range: f64) -> Rgba {
               (x.b as f64 + ((y.b as f64 - x.b as f64) * range)) as u8, 255)
 }
 
-/// Mirrors ImageHelper.LerpColors(Color[], range): 1->first, 0->Black, range 0/1 edges,
+/// Mirrors ImageHelper.LerpColors(Color[], range): single->itself, empty->Black, range 0/1 edges,
 /// position = range*(n-1), floor/frac segment lerp. Panics outside [0,1] like C#.
 pub fn lerp_palette(colors: &[Rgba], range: f64) -> Rgba {
     if colors.len() == 1 { return colors[0]; }
