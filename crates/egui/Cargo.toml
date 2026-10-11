@@ -1,0 +1,10 @@
+[package]
+name = "mappalachia-egui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mappalachia-core = { path = "../core" }
+mappalachia-render = { path = "../render" }
+eframe = "0.32"
+egui = "0.32"
