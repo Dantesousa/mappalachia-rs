@@ -22,7 +22,9 @@
 //!   reads/writes `"Brightness"`, matching the .NET property names (the
 //!   default `FileIO.JsonSerializerOptions` apply no naming policy).
 //! - Missing fields fall back to the exact C# defaults (including
-//!   `Brightness = 0.5` and `BackgroundImage = Menu`).
+//!   `BackgroundImage = Menu`), except `Brightness`, which defaults to
+//!   `1.0` as a deliberate product deviation from the C# `0.5`
+//!   (see `default_brightness`).
 //! - Enums serialize as PascalCase strings (the variant names, which already
 //!   are PascalCase) and deserialize from either the string or the STJ
 //!   numeric index (declaration order), since .NET writes enums as numbers
@@ -115,8 +117,15 @@ pascal_enum!(VolumeDrawMode, [Fill, Border, Both]);
 // Field helpers
 // ---------------------------------------------------------------------------
 
+/// Product default for a missing `Brightness`.
+///
+/// Deliberate deviation from the C# reference (`MapSettings.Brightness =
+/// 0.5`): fresh maps / UI state start at full brightness `1.0` (no dimming),
+/// which the golden fixture also pins explicitly, so golden dHashes are
+/// unaffected by this default. (The C# 0.5 default is still accepted on
+/// read, and any value is clamped to `0.1..=2.0` like the C# setter.)
 fn default_brightness() -> f32 {
-    0.5
+    1.0
 }
 
 fn palette_to_html(palette: &[Rgba]) -> Vec<String> {
@@ -389,9 +398,10 @@ pub struct MapSettings {
 }
 
 fn de_brightness<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
-    // Accepts a missing field (C# default 0.5) or a present value (clamped).
+    // Accepts a missing/null field (product default 1.0; deliberate
+    // deviation from the C# 0.5) or a present value (clamped).
     let opt = Option::<f32>::deserialize(d)?;
-    Ok(opt.unwrap_or(0.5).clamp(0.1, 2.0))
+    Ok(opt.unwrap_or(1.0).clamp(0.1, 2.0))
 }
 
 impl Default for MapSettings {
@@ -399,7 +409,9 @@ impl Default for MapSettings {
         Self {
             font_settings: FontSettings::default(),
             background_image: BackgroundImageType::Menu,
-            brightness: 0.5,
+            // Deliberate product deviation: C# defaults to 0.5; we start
+            // at full brightness 1.0 (see `default_brightness`).
+            brightness: 1.0,
             spotlight_location: Coord::new(0.0, 0.0),
             spotlight_size: 2.0,
             grayscale_background: false,
@@ -515,7 +527,9 @@ mod tests {
     #[test]
     fn defaults_match_csharp() {
         let map = MapSettings::default();
-        assert_eq!(map.brightness, 0.5);
+        // Deliberate product deviation from the C# 0.5 (see
+        // `default_brightness`): fresh maps start at full brightness.
+        assert_eq!(map.brightness, 1.0);
         assert_eq!(map.background_image, BackgroundImageType::Menu);
         assert_eq!(map.legend_style, LegendStyle::Compact);
         assert_eq!(
@@ -584,8 +598,20 @@ mod tests {
         let map = MapSettings::default();
         let v = serde_json::to_value(&map).unwrap();
         assert_eq!(v["BackgroundImage"], json!("Menu"));
-        assert_eq!(v["Brightness"], json!(0.5));
+        assert_eq!(v["Brightness"], json!(1.0));
         assert_eq!(v["Title"], json!(""));
+    }
+
+    #[test]
+    fn default_brightness_is_full_not_csharp_half() {
+        // Deliberate product deviation from the C# 0.5 default.
+        assert_eq!(MapSettings::default().brightness, 1.0);
+        // A missing field takes the product default...
+        let map: MapSettings = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(map.brightness, 1.0);
+        // ...while an explicit C# 0.5 still reads back as 0.5.
+        let map: MapSettings = serde_json::from_value(json!({"Brightness": 0.5})).unwrap();
+        assert_eq!(map.brightness, 0.5);
     }
 
     #[test]
