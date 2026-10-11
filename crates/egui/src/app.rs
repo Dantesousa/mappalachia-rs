@@ -458,6 +458,14 @@ impl App {
             }
         }
         let removed = doomed.len();
+        if removed == 0 {
+            self.status = format!(
+                "Nothing checked; {} item(s) on map; {} result(s).",
+                self.items.len(),
+                self.results.len()
+            );
+            return;
+        }
         self.items.retain(|it| !doomed.contains(&item_key(it)));
         let mut results = Vec::with_capacity(self.results.len());
         let mut checked = Vec::with_capacity(self.checked.len());
@@ -850,6 +858,7 @@ impl App {
         bool,
         bool,
         PlotMode,
+        PlotStyleSettings,
     ) {
         (
             self.space_idx,
@@ -864,6 +873,7 @@ impl App {
             self.show_markers,
             self.show_infestations,
             self.plot_mode,
+            self.plot_style.clone(),
         )
     }
 }
