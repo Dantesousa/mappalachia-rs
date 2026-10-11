@@ -166,6 +166,7 @@ impl View {
                factor: space.max_range / mappalachia_core::common::MAP_IMAGE_RESOLUTION as f64 }
     }
 }
+```
 
 /// Mirrors AsImagePoint: x = (wx-cx)/f + 2048; y = ((-wy+cy)/f) + 2048 (Y flip).
 
