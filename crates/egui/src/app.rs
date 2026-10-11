@@ -25,12 +25,48 @@ use mappalachia_render::{
 /// (`A.png..G.png`; cf. `render::icon::PlotIcon::assign` docs).
 const PLOT_ICON_COUNT: usize = 7;
 
-/// One entry of the items-to-plot list: a search result plus its
+/// One merged search-results row: raw `core::search` hits that render
+/// identically (same entity + space + `legend_text(include_count = false)`;
+/// hidden-field differences like quantity stay in `variants`) are grouped.
+/// `display` is the first hit with the summed count; `variants` keeps every
+/// raw hit so plotting loses no instances. Never merges across spaces (the
+/// space id is part of the key).
+#[derive(Debug, Clone)]
+pub struct ResultRow {
+    pub display: SearchResult,
+    pub variants: Vec<SearchResult>,
+}
+
+impl ResultRow {
+    /// Summed count over all variants (mirrors the row's `(xN)` badge).
+    pub fn count(&self) -> i64 {
+        self.variants.iter().map(|v| v.count()).sum()
+    }
+    #[allow(dead_code)]
+    pub fn editor_id(&self) -> &str {
+        self.display.editor_id()
+    }
+    #[allow(dead_code)]
+    pub fn form_id(&self) -> u32 {
+        self.display.form_id()
+    }
+    pub fn space(&self) -> &Space {
+        self.display.space()
+    }
+    pub fn entity_kind(&self) -> &EntityKind {
+        self.display.entity_kind()
+    }
+}
+
+/// One entry of the items-to-plot list: a merged result row plus its
 /// freshly-assigned legend group, icon and legend text
 /// (mirrors `FormMain.ButtonAddToMap_Click`, non-grouped path).
+/// `variants` carries every raw hit so the preview worker can expand one
+/// `Plottable` per variant (sharing group/icon/legend) with no loss.
 #[derive(Debug, Clone)]
 pub struct PlotItem {
     pub result: SearchResult,
+    pub variants: Vec<SearchResult>,
     pub legend_group: usize,
     pub icon: PlotIcon,
     pub legend: String,
@@ -56,8 +92,13 @@ pub struct App {
     pub spaces: Vec<Space>,
     /// Index into `spaces`; defaults to the APPALACHIA space.
     pub space_idx: usize,
-    /// Last search results.
-    pub results: Vec<SearchResult>,
+    /// C# `SearchSettings.SearchInAllSpaces` parity: when true the search
+    /// is unscoped (`space_form_id = None`) so components like antiseptic
+    /// are found outside the current space; when false (default) the
+    /// search is scoped to `spaces[space_idx]`.
+    pub search_all_spaces: bool,
+    /// Last search results (one row per merged display group).
+    pub results: Vec<ResultRow>,
     /// Checkbox state, parallel to `results`.
     pub checked: Vec<bool>,
     /// Items-to-plot.
@@ -210,6 +251,7 @@ impl App {
             space_idx,
             results: Vec::new(),
             checked: Vec::new(),
+            search_all_spaces: false,
             items: Vec::new(),
             next_group: 0,
             background: BackgroundImageType::Menu,
@@ -358,7 +400,11 @@ impl App {
     fn search_params(&self) -> SearchParams {
         SearchParams {
             search_term: self.search_term.clone(),
-            space_form_id: self.spaces.get(self.space_idx).map(|s| s.form_id()),
+            space_form_id: if self.search_all_spaces {
+                None
+            } else {
+                self.spaces.get(self.space_idx).map(|s| s.form_id())
+            },
             advanced: false,
             search_in_instances_only: false,
             signatures: Signature::recommended_default(),
@@ -376,14 +422,15 @@ impl App {
             .clone()
             .ok_or_else(|| "MAPPALACHIA_DB is not set".to_string())?;
         let conn = db::open_readonly(&path).map_err(|e| format!("DB open failed: {e}"))?;
-        if self.spaces.is_empty() {
+        if self.spaces.is_empty() && !self.search_all_spaces {
             return Err("Space list is empty; cannot scope search".to_string());
         }
         let params = self.search_params();
-        let results = search(&conn, &params).map_err(|e| format!("Search failed: {e}"))?;
-        let n = results.len();
+        let raw = search(&conn, &params).map_err(|e| format!("Search failed: {e}"))?;
+        let rows = merge_results(raw);
+        let n = rows.len();
         self.checked = vec![false; n];
-        self.results = results;
+        self.results = rows;
         self.status = format!("Search found {n} result(s).");
         Ok(())
     }
@@ -405,8 +452,8 @@ impl App {
             if self.items.iter().any(|it| item_key(it) == key) {
                 continue;
             }
-            let legend = result_legend_text(&self.results[i]);
-            let no_icon = is_region_or_location(&self.results[i]);
+            let legend = result_legend_text(&self.results[i].display);
+            let no_icon = is_region_or_location(&self.results[i].display);
             // C# non-grouped path calls `GetNextAvailableLegendGroup()`
             // per item, so groups stay dense after removals.
             let group = self.next_available_group();
@@ -417,13 +464,28 @@ impl App {
                 no_icon,
                 PLOT_ICON_COUNT,
             );
-            let mut result = self.results[i].clone();
-            match &mut result {
+            let mut display = self.results[i].display.clone();
+            match &mut display {
                 SearchResult::Grouped(g) => g.legend_group = group as i32,
                 SearchResult::Singular { inner, .. } => inner.legend_group = group as i32,
             }
+            let variants = self.results[i]
+                .variants
+                .iter()
+                .map(|v| {
+                    let mut stamped = v.clone();
+                    match &mut stamped {
+                        SearchResult::Grouped(g) => g.legend_group = group as i32,
+                        SearchResult::Singular { inner, .. } => {
+                            inner.legend_group = group as i32;
+                        }
+                    }
+                    stamped
+                })
+                .collect();
             self.items.push(PlotItem {
-                result,
+                result: display,
+                variants,
                 legend_group: group,
                 icon,
                 legend,
@@ -511,10 +573,10 @@ impl App {
     }
 
     /// The item the interiors finder searches for: the first checked
-    /// result, else the first item-to-plot (kept simple by design).
+    /// row's display result, else the first item-to-plot (kept simple by design).
     fn interiors_target(&self) -> Option<SearchResult> {
         if let Some(i) = self.checked.iter().position(|&c| c) {
-            return self.results.get(i).cloned();
+            return self.results.get(i).map(|row| row.display.clone());
         }
         self.items.first().map(|it| it.result.clone())
     }
@@ -710,7 +772,7 @@ impl App {
             space: settings.space,
             map_settings: MapSettingsStub::from(map_value),
             plot_settings: PlotSettingsStub::from(plot_value),
-            items_to_plot: self.items.iter().map(plot_item_to_result).collect(),
+            items_to_plot: self.items.iter().flat_map(plot_item_to_results).collect(),
         }
         .save_to_file(path)
     }
@@ -795,7 +857,8 @@ impl App {
                 PLOT_ICON_COUNT,
             );
             items.push(PlotItem {
-                result: owned,
+                result: owned.clone(),
+                variants: vec![owned],
                 legend_group: group,
                 icon,
                 legend,
@@ -918,17 +981,51 @@ pub fn recommend_jpeg(space: &Space, background: BackgroundImageType) -> bool {
     space.is_worldspace && background != BackgroundImageType::None
 }
 
-/// Convert an items-to-plot entry back to a recipe `SearchResult`,
-/// stamping the assigned group + legend text.
-fn plot_item_to_result(item: &PlotItem) -> SearchResult {
-    let mut result = item.result.clone();
-    let grouped = match &mut result {
-        SearchResult::Grouped(g) => g,
-        SearchResult::Singular { inner, .. } => inner,
+/// Convert an items-to-plot entry back to recipe `SearchResult`s, stamping
+/// the assigned group + legend text onto every variant (one entry per
+/// variant, so reopening loses no instances; each reopens as its own
+/// single-variant item sharing the stored group).
+fn plot_item_to_results(item: &PlotItem) -> Vec<SearchResult> {
+    let stamp = |mut result: SearchResult| {
+        let grouped = match &mut result {
+            SearchResult::Grouped(g) => g,
+            SearchResult::Singular { inner, .. } => inner,
+        };
+        grouped.legend_group = item.legend_group as i32;
+        grouped.legend_text = Some(item.legend.clone());
+        result
     };
-    grouped.legend_group = item.legend_group as i32;
-    grouped.legend_text = Some(item.legend.clone());
-    result
+    if item.variants.is_empty() {
+        vec![stamp(item.result.clone())]
+    } else {
+        item.variants.iter().cloned().map(stamp).collect()
+    }
+}
+
+/// Expand items-to-plot into one [`Plottable`] per variant, sharing the
+/// item's group/icon/legend so no instances are lost.
+fn expand_plot_items(items: &[PlotItem]) -> Vec<Plottable> {
+    let mut out = Vec::new();
+    for it in items {
+        if it.variants.is_empty() {
+            out.push(Plottable {
+                result: it.result.clone(),
+                legend_group: it.legend_group as i32,
+                legend_text: it.legend.clone(),
+                icon: it.icon,
+            });
+        } else {
+            for v in &it.variants {
+                out.push(Plottable {
+                    result: v.clone(),
+                    legend_group: it.legend_group as i32,
+                    legend_text: it.legend.clone(),
+                    icon: it.icon,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Run the Standard render off-thread: open the DB + assets on the worker,
@@ -945,15 +1042,7 @@ fn render_preview_bytes(
 ) -> PreviewResult {
     let conn = db::open_readonly(db_path).map_err(|e| format!("DB open failed: {e}"))?;
     let mut assets = Assets::open(assets_root);
-    let plottables: Vec<Plottable> = items
-        .into_iter()
-        .map(|it| Plottable {
-            result: it.result,
-            legend_group: it.legend_group as i32,
-            legend_text: it.legend,
-            icon: it.icon,
-        })
-        .collect();
+    let plottables: Vec<Plottable> = expand_plot_items(&items);
     let pix = draw(DrawInput {
         conn: &conn,
         assets: &mut assets,
@@ -983,25 +1072,58 @@ fn straight_rgba_bytes(pix: &tiny_skia::Pixmap) -> Vec<u8> {
     out
 }
 
-/// Identity of a search result, used to dedupe adds and to match items back
-/// to the results they were added from.
-fn result_key(r: &SearchResult) -> (String, u32, u32, Option<u32>) {
-    let instance = match r {
-        SearchResult::Grouped(_) => None,
-        SearchResult::Singular {
-            instance_form_id, ..
-        } => Some(*instance_form_id),
-    };
+/// Merge key for identical-display rows: entity form_id + editor_id +
+/// space id + `legend_text(include_count = false)`. Spaces never merge
+/// (space id is part of the key); hidden-field differences (quantity,
+/// spawn weight, count) stay in the row's variants.
+fn merge_key(r: &SearchResult) -> (u32, String, u32, String) {
     (
-        r.editor_id().to_string(),
         r.form_id(),
+        r.editor_id().to_string(),
         r.space().form_id(),
-        instance,
+        grouped_of(r).legend_text(false),
     )
 }
 
-fn item_key(it: &PlotItem) -> (String, u32, u32, Option<u32>) {
-    result_key(&it.result)
+/// Group raw `core::search` output into one [`ResultRow`] per merge key,
+/// preserving first-seen order. The row `display` is the first hit with
+/// the summed count; `variants` keeps every raw hit.
+pub fn merge_results(results: Vec<SearchResult>) -> Vec<ResultRow> {
+    let mut order: Vec<(u32, String, u32, String)> = Vec::new();
+    let mut groups: std::collections::HashMap<(u32, String, u32, String), Vec<SearchResult>> =
+        std::collections::HashMap::new();
+    for r in results {
+        let key = merge_key(&r);
+        groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            Vec::new()
+        });
+        groups.get_mut(&key).expect("just inserted").push(r);
+    }
+    order
+        .into_iter()
+        .map(|key| {
+            let variants = groups.remove(&key).expect("grouped key");
+            let total: i64 = variants.iter().map(|v| v.count()).sum();
+            let mut display = variants[0].clone();
+            match &mut display {
+                SearchResult::Grouped(g) => g.count = total,
+                SearchResult::Singular { inner, .. } => inner.count = total,
+            }
+            ResultRow { display, variants }
+        })
+        .collect()
+}
+
+/// Identity of a merged row, used to dedupe adds and to match items back
+/// to the rows they were added from. Operates on rows (the display key),
+/// so re-adding a checked row is a no-op.
+fn result_key(row: &ResultRow) -> (u32, String, u32, String) {
+    merge_key(&row.display)
+}
+
+fn item_key(it: &PlotItem) -> (u32, String, u32, String) {
+    merge_key(&it.result)
 }
 
 /// Mirrors `GroupedSearchResult.GenerateLegendText(settings)` with
@@ -1016,6 +1138,38 @@ fn grouped_of(r: &SearchResult) -> &Grouped {
         SearchResult::Grouped(g) => g,
         SearchResult::Singular { inner, .. } => inner,
     }
+}
+
+/// Primary name for a result row: derived entities (NPC/scrap/flux) show
+/// the `DisplayName` (e.g. `Derived Antiseptic Scrap`) which the user
+/// recognizes; base entities show the `EditorID`.
+fn row_primary_name(row: &ResultRow) -> &str {
+    let g = grouped_of(&row.display);
+    match row.entity_kind() {
+        EntityKind::DerivedNpc | EntityKind::DerivedScrap | EntityKind::DerivedFlux(_) => {
+            &g.entity.display_name
+        }
+        _ => &g.entity.editor_id,
+    }
+}
+
+/// Row labels: primary `{name} (x{count})` plus secondary disambiguation
+/// (`space | label | lock`) so rows that share a name no longer look like
+/// clones.
+pub fn row_labels(row: &ResultRow) -> (String, String) {
+    let primary = format!("{} (x{})", row_primary_name(row), row.count());
+    let g = grouped_of(&row.display);
+    let mut secondary = row.space().friendly_name();
+    if !g.label.trim().is_empty() {
+        secondary.push_str(&format!(" | {}", g.label));
+    }
+    if g.lock_level != LockLevel::None {
+        secondary.push_str(&format!(
+            " | {}",
+            g.lock_level.to_friendly_name_with_context()
+        ));
+    }
+    (primary, secondary)
 }
 
 /// Mirrors `result.Entity is Library.Region or Library.Location`.
@@ -1056,6 +1210,7 @@ impl eframe::App for App {
                             ui.selectable_value(&mut self.space_idx, i, name);
                         }
                     });
+                ui.checkbox(&mut self.search_all_spaces, "All spaces");
                 if ui.button("Search").clicked() {
                     if let Err(e) = self.run_search() {
                         self.status = e;
@@ -1073,13 +1228,18 @@ impl eframe::App for App {
                     .max_height(300.0)
                     .show(ui, |ui| {
                         for i in 0..self.results.len() {
-                            let label = {
-                                let r = &self.results[i];
-                                format!("{} (x{})", r.editor_id(), r.count())
-                            };
-                            let mut c = self.checked[i];
-                            if ui.checkbox(&mut c, label).changed() {
-                                self.checked[i] = c;
+                            let (primary, secondary) = row_labels(&self.results[i]);
+                            let current = self.checked[i];
+                            let (changed, next) = ui
+                                .horizontal(|ui| {
+                                    let mut tmp = current;
+                                    let changed = ui.checkbox(&mut tmp, primary).changed();
+                                    ui.weak(secondary);
+                                    (changed, tmp)
+                                })
+                                .inner;
+                            if changed {
+                                self.checked[i] = next;
                             }
                         }
                     });
@@ -1481,7 +1641,7 @@ mod tests {
         let mut app = settings_app();
         let space = app.spaces[app.space_idx].clone();
         let item = test_plot_item(&space, 0);
-        app.results = vec![item.result.clone()];
+        app.results = vec![single_row(item.result.clone())];
         app.checked = vec![true];
         app.preview = PreviewState::Rendering;
         let (_tx, rx) = std::sync::mpsc::channel::<PreviewResult>();
@@ -1500,7 +1660,7 @@ mod tests {
         let mut app = settings_app();
         let space = app.spaces[app.space_idx].clone();
         let item = test_plot_item(&space, 0);
-        app.results = vec![item.result.clone()];
+        app.results = vec![single_row(item.result.clone())];
         app.checked = vec![true];
         app.items = vec![item];
         app.preview = PreviewState::Failed("stale".to_string());
@@ -1689,8 +1849,10 @@ mod tests {
             plot_icon: None,
         };
         let style = PlotStyleSettings::default();
+        let result = SearchResult::Grouped(grouped);
         PlotItem {
-            result: SearchResult::Grouped(grouped),
+            result: result.clone(),
+            variants: vec![result],
             legend_group: group,
             icon: PlotIcon::assign(
                 group,
@@ -1701,6 +1863,42 @@ mod tests {
             ),
             legend: format!("EDID{group}"),
         }
+    }
+
+    /// Wrap a raw result as a single-variant merged row.
+    fn single_row(r: SearchResult) -> ResultRow {
+        ResultRow {
+            display: r.clone(),
+            variants: vec![r],
+        }
+    }
+
+    /// Fake grouped hit for DB-free merge tests.
+    fn fake_grouped(
+        space: &Space,
+        editor: &str,
+        display_name: &str,
+        count: i64,
+        label: &str,
+    ) -> SearchResult {
+        SearchResult::Grouped(Grouped {
+            entity: Entity::new(
+                0x2000,
+                editor,
+                display_name,
+                Signature::Misc,
+                EntityKind::Standard,
+            ),
+            space: space.clone(),
+            count,
+            spawn_weight: 1.0,
+            label: label.to_string(),
+            lock_level: LockLevel::None,
+            in_container: false,
+            legend_group: 0,
+            legend_text: None,
+            plot_icon: None,
+        })
     }
 
     #[test]
@@ -1858,7 +2056,10 @@ mod tests {
         let space = app.spaces[app.space_idx].clone();
         let item0 = test_plot_item(&space, 0);
         let item1 = test_plot_item(&space, 1);
-        app.results = vec![item0.result.clone(), item1.result.clone()];
+        app.results = vec![
+            single_row(item0.result.clone()),
+            single_row(item1.result.clone()),
+        ];
         app.checked = vec![false, true];
         app.items = vec![item0, item1];
         app.next_group = 2;
@@ -1881,7 +2082,7 @@ mod tests {
         let mut app = settings_app();
         let space = app.spaces[app.space_idx].clone();
         let item = test_plot_item(&space, 0);
-        app.results = vec![item.result.clone()];
+        app.results = vec![single_row(item.result.clone())];
         app.checked = vec![true];
         app.add_selected();
         assert!(app.dirty, "add must mark dirty");
@@ -1954,9 +2155,9 @@ mod tests {
         assert!(!app.all_checked(), "empty list is not 'all checked'");
         let space = app.spaces[app.space_idx].clone();
         app.results = vec![
-            test_plot_item(&space, 0).result,
-            test_plot_item(&space, 1).result,
-            test_plot_item(&space, 2).result,
+            single_row(test_plot_item(&space, 0).result),
+            single_row(test_plot_item(&space, 1).result),
+            single_row(test_plot_item(&space, 2).result),
         ];
         app.checked = vec![false, true, false];
         assert!(!app.all_checked());
@@ -1973,7 +2174,10 @@ mod tests {
         let mut app = settings_app();
         let space = app.spaces[app.space_idx].clone();
         let made: Vec<PlotItem> = (0..3).map(|g| test_plot_item(&space, g)).collect();
-        app.results = made.iter().map(|it| it.result.clone()).collect();
+        app.results = made
+            .iter()
+            .map(|it| single_row(it.result.clone()))
+            .collect();
         app.checked = vec![true, false, true];
         app.items = vec![made[0].clone(), made[2].clone()];
         app.remove_selected();
@@ -1992,7 +2196,7 @@ mod tests {
         let mut app = settings_app();
         let space = app.spaces[app.space_idx].clone();
         let item = test_plot_item(&space, 0);
-        app.results = vec![item.result.clone()];
+        app.results = vec![single_row(item.result.clone())];
         app.checked = vec![true];
         app.items = vec![item];
         app.clear_results();
@@ -2047,9 +2251,9 @@ mod tests {
             "current space needs connected CELL spaces"
         );
         let mut picked: Option<usize> = None;
-        'outer: for (i, r) in app.results.iter().take(8).enumerate() {
+        'outer: for (i, row) in app.results.iter().take(8).enumerate() {
             for dest in targets.iter().take(4) {
-                let n = instances::instances(&conn, r.clone(), dest)
+                let n = instances::instances(&conn, row.display.clone(), dest)
                     .expect("instances resolve")
                     .len();
                 if n > 0 {
@@ -2094,5 +2298,163 @@ mod tests {
         // Out-of-range click is a no-op.
         app.apply_interior(999);
         assert_eq!(app.space_idx, target_idx);
+    }
+
+    /// Merge (DB-free): identical-display rows merge, counts sum, variants
+    /// kept; distinct rows (label / editor / space) stay separate; spaces
+    /// never merge.
+    #[test]
+    fn merge_identical_rows_sum_counts_and_keep_variants() {
+        let app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        let a = fake_grouped(&space, "MilitaryAmmoBag", "Ammo Bag", 2, "");
+        let b = fake_grouped(&space, "MilitaryAmmoBag", "Ammo Bag", 3, "");
+        let rows = merge_results(vec![a, b]);
+        assert_eq!(rows.len(), 1, "identical-display rows must merge");
+        assert_eq!(rows[0].variants.len(), 2);
+        assert_eq!(rows[0].count(), 5, "counts must sum");
+    }
+
+    #[test]
+    fn merge_keeps_distinct_rows_and_never_across_spaces() {
+        let app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        let other = Space::new(
+            0x0000_0010,
+            "CELL0002",
+            "Test Cell 2",
+            false,
+            false,
+            0.0,
+            0.0,
+            1000.0,
+            0.0,
+        );
+        let rows = merge_results(vec![
+            fake_grouped(&space, "AmmoBag", "Ammo Bag", 1, ""),
+            // Different label -> distinct legend -> distinct row.
+            fake_grouped(&space, "AmmoBag", "Ammo Bag", 1, "Shelf"),
+            // Different editor -> distinct row.
+            fake_grouped(&space, "OtherBag", "Other Bag", 1, ""),
+            // Same everything but another space -> must NOT merge.
+            fake_grouped(&other, "AmmoBag", "Ammo Bag", 1, ""),
+        ]);
+        assert_eq!(
+            rows.len(),
+            4,
+            "distinct rows and cross-space rows stay separate"
+        );
+    }
+
+    #[test]
+    fn merged_row_adds_once_expands_to_all_variants_and_readd_is_noop() {
+        let mut app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        app.results = merge_results(vec![
+            fake_grouped(&space, "MilitaryAmmoBag", "Ammo Bag", 2, ""),
+            fake_grouped(&space, "MilitaryAmmoBag", "Ammo Bag", 3, ""),
+        ]);
+        assert_eq!(app.results.len(), 1);
+        app.checked = vec![true];
+        app.add_selected();
+        assert_eq!(app.items.len(), 1, "one row adds one item");
+        assert_eq!(app.items[0].variants.len(), 2);
+        let expanded = expand_plot_items(&app.items);
+        assert_eq!(expanded.len(), 2, "expansion must cover every variant");
+        for p in &expanded {
+            assert_eq!(p.legend_group, app.items[0].legend_group as i32);
+            assert_eq!(p.legend_text, app.items[0].legend);
+            assert_eq!(p.icon, app.items[0].icon);
+        }
+        app.add_selected();
+        assert_eq!(app.items.len(), 1, "re-adding the row must be a no-op");
+    }
+
+    #[test]
+    fn row_labels_show_space_label_lock_and_derived_display_name() {
+        let app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        let row =
+            &merge_results(vec![fake_grouped(&space, "AmmoBag", "Ammo Bag", 4, "")])[0].clone();
+        let (primary, secondary) = row_labels(row);
+        assert!(primary.contains("AmmoBag"), "got: {primary}");
+        assert!(primary.contains("x4"), "got: {primary}");
+        assert!(
+            secondary.contains("Appalachia"),
+            "secondary must name the space, got: {secondary}"
+        );
+        let labelled = &merge_results(vec![fake_grouped(
+            &space, "AmmoBag", "Ammo Bag", 1, "Shelf",
+        )])[0]
+            .clone();
+        assert!(
+            row_labels(labelled).1.contains("Shelf"),
+            "secondary must carry the label"
+        );
+        // Derived entities show the DisplayName, not the bare editor id.
+        let derived = ResultRow {
+            display: SearchResult::Grouped(Grouped {
+                entity: Entity::derived_scrap("Antiseptic"),
+                space: space.clone(),
+                count: 2,
+                spawn_weight: 1.0,
+                label: String::new(),
+                lock_level: LockLevel::None,
+                in_container: false,
+                legend_group: 0,
+                legend_text: None,
+                plot_icon: None,
+            }),
+            variants: vec![],
+        };
+        let (primary, _) = row_labels(&derived);
+        assert!(
+            primary.contains("Derived Antiseptic Scrap"),
+            "derived rows must show the DisplayName, got: {primary}"
+        );
+    }
+
+    #[test]
+    fn search_scope_all_spaces_unscopes_and_default_scopes() {
+        let mut app = settings_app();
+        assert!(!app.search_all_spaces, "scoped search is the default");
+        assert_eq!(
+            app.search_params().space_form_id,
+            Some(app.spaces[app.space_idx].form_id())
+        );
+        app.search_all_spaces = true;
+        assert_eq!(app.search_params().space_form_id, None);
+    }
+
+    /// DB-gated: `MilitaryAmmoBag` yields several identical-display rows
+    /// that must merge into exactly one row with all variants kept.
+    #[test]
+    fn search_militaryammobag_merges_to_single_row() {
+        let Some(mut app) = search_app() else {
+            eprintln!("SKIP: MAPPALACHIA_DB unset");
+            return;
+        };
+        app.search_term = "MilitaryAmmoBag".to_string();
+        let conn =
+            db::open_readonly(app.db_path.as_deref().expect("db path")).expect("test DB opens");
+        let raw = search(&conn, &app.search_params()).expect("raw search succeeds");
+        if raw.is_empty() {
+            eprintln!("SKIP: no MilitaryAmmoBag rows in this DB");
+            return;
+        }
+        app.run_search().expect("search succeeds");
+        assert_eq!(
+            app.results.len(),
+            1,
+            "MilitaryAmmoBag rows must merge to one (raw: {})",
+            raw.len()
+        );
+        let row = &app.results[0];
+        assert_eq!(row.variants.len(), raw.len(), "no instances may be lost");
+        assert_eq!(
+            row.count(),
+            raw.iter().map(|r| r.count()).sum::<i64>(),
+            "row count must sum the raw counts"
+        );
     }
 }
