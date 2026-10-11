@@ -13,7 +13,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release -p mappalachia-cli -p mappalachia-egui
-      - run: Compress-Archive -Path target/release/mappalachia-cli.exe,target/release/mappalachia-egui.exe -Destination mappalachia-rs-windows.zip
+      - name: Fetch game data bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download --pattern 'mappalachia-rs-data.zip' --clobber
+      - name: Stage bundle
+        run: |
+          mkdir staging
+          Expand-Archive -Path mappalachia-rs-data.zip -DestinationPath staging
+          Copy-Item -Path target/release/mappalachia-cli.exe, target/release/mappalachia-egui.exe -Destination staging/
+      - name: Pack bundle
+        run: Compress-Archive -Path staging/mappalachia-cli.exe, staging/mappalachia-egui.exe, staging/data, staging/img, staging/font -DestinationPath mappalachia-rs-windows.zip
       - uses: softprops/action-gh-release@v2
         with:
           files: mappalachia-rs-windows.zip
@@ -28,7 +38,7 @@ jobs:
           sudo apt-get update &&
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev
           libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
-          libwayland-dev libxkbcommon-x11-dev
+          libwayland-dev libxkbcommon-x11-dev unzip
       - run: cargo build --release -p mappalachia-cli -p mappalachia-egui
       - name: Package AppImage
         run: |
@@ -42,8 +52,17 @@ jobs:
           ./linuxdeploy-x86_64.AppImage --appdir AppDir --desktop-file AppDir/mappalachia-rs.desktop --icon-file AppDir/mappalachia-rs.png --output appimage
           mv Mappalachia_RS-*.AppImage mappalachia-rs-x86_64.AppImage
           cp target/release/mappalachia-cli mappalachia-cli-linux-x86_64
+      - name: Fetch game data bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download --pattern 'mappalachia-rs-data.zip' --clobber
+      - name: Stage and pack Linux bundle
+        run: |
+          mkdir -p staging
+          unzip -q mappalachia-rs-data.zip -d staging
+          cp mappalachia-rs-x86_64.AppImage mappalachia-cli-linux-x86_64 staging/
+          chmod +x staging/mappalachia-rs-x86_64.AppImage staging/mappalachia-cli-linux-x86_64
+          tar -czf mappalachia-rs-linux.tar.gz -C staging mappalachia-rs-x86_64.AppImage mappalachia-cli-linux-x86_64 data img font
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            mappalachia-rs-x86_64.AppImage
-            mappalachia-cli-linux-x86_64
+          files: mappalachia-rs-linux.tar.gz

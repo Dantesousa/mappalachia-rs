@@ -14,8 +14,22 @@ Generates and exports maps of entities in the Fallout 76 game world.
 
 ## Run
 
-You need game data (not shipped in git): download `mappalachia-rs-data.zip`
-from the [latest release](https://github.com/Dantesousa/mappalachia-rs/releases/latest)
+One download per platform — game data ships inside the bundle, no setup:
+
+- **Windows:** download `mappalachia-rs-windows.zip` from the
+  [latest release](https://github.com/Dantesousa/mappalachia-rs/releases/latest),
+  extract it, and run `mappalachia-egui.exe` (GUI) or `mappalachia-cli.exe`
+  (headless). The zip contains both binaries plus `data/`, `img/`, `font/`.
+- **Linux:** download `mappalachia-rs-linux.tar.gz` from the
+  [latest release](https://github.com/Dantesousa/mappalachia-rs/releases/latest),
+  extract it (`tar -xzf mappalachia-rs-linux.tar.gz`), and run the AppImage
+  (`./mappalachia-rs-x86_64.AppImage`) or the CLI
+  (`./mappalachia-cli-linux-x86_64`). The tarball contains both binaries
+  plus `data/`, `img/`, `font/` — keep them next to the binary you run.
+
+From source you still need game data (not shipped in git): download
+`mappalachia-rs-data.zip` from the
+[latest release](https://github.com/Dantesousa/mappalachia-rs/releases/latest)
 (`data/mappalachia.db` + `img/` + `font/`) and extract it next to the binaries —
 or point `MAPPALACHIA_DB` / `MAPPALACHIA_ASSETS` at any Mappalachia data tree.
 
