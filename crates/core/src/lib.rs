@@ -3,3 +3,4 @@ pub mod db;
 pub mod enums;
 pub mod geometry;
 pub mod model;
+pub mod search;
