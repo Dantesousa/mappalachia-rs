@@ -4,6 +4,7 @@ use mappalachia_core::{
     common::MAP_IMAGE_RESOLUTION,
     db,
     enums::{LockLevel, Signature},
+    instances,
     model::{EntityKind, Space},
     recipe::{load_recipe_file, MapSettingsStub, PlotSettingsStub, Recipe},
     search::{search, Grouped, SearchParams, SearchResult},
@@ -33,6 +34,16 @@ pub struct PlotItem {
     pub legend_group: usize,
     pub icon: PlotIcon,
     pub legend: String,
+}
+
+/// One connected-interior hit: a CELL space reachable via a teleporter
+/// from the current space that contains instances of the searched item.
+/// `space_idx` indexes [`App::spaces`] so a row click can switch to it.
+#[derive(Debug, Clone)]
+pub struct InteriorHit {
+    pub space_idx: usize,
+    pub display_name: String,
+    pub count: usize,
 }
 
 pub struct App {
@@ -98,6 +109,21 @@ pub struct App {
     /// an invalid rect); the Reset-view button restores it. Never touches
     /// the Render/texture flow — it only re-frames the uploaded texture.
     pub scene_rect: egui::Rect,
+    /// Auto-render toggle (default ON): when set, [`App::maybe_auto_render`]
+    /// spawns a preview on the next frame after any render-affecting
+    /// mutation. The Render button always works manually when off.
+    pub auto_render: bool,
+    /// True when render-affecting state changed since the last preview
+    /// spawn. Set by [`App::invalidate_preview`]; cleared on spawn by
+    /// [`App::maybe_auto_render`], so a finished preview never re-triggers.
+    /// The export/recipe filename field is deliberately excluded (it never
+    /// invalidates).
+    pub dirty: bool,
+    /// Last interiors-finder hits (connected CELL spaces holding the
+    /// searched item), refreshed by [`App::find_interiors`].
+    pub interiors: Vec<InteriorHit>,
+    /// Editor id of the item [`App::interiors`] was searched for.
+    pub interiors_for: String,
 }
 
 /// Preview lifecycle: idle, worker running, uploaded texture, or worker
@@ -204,6 +230,10 @@ impl App {
             preview: PreviewState::Idle,
             preview_rx: None,
             scene_rect: egui::Rect::ZERO,
+            auto_render: true,
+            dirty: false,
+            interiors: Vec::new(),
+            interiors_for: String::new(),
         }
     }
 
@@ -427,6 +457,7 @@ impl App {
                 doomed.push(result_key(&self.results[i]));
             }
         }
+        let removed = doomed.len();
         self.items.retain(|it| !doomed.contains(&item_key(it)));
         let mut results = Vec::with_capacity(self.results.len());
         let mut checked = Vec::with_capacity(self.checked.len());
@@ -440,11 +471,130 @@ impl App {
         self.checked = checked;
         self.next_group = self.next_available_group();
         self.status = format!(
-            "{} item(s) on map; {} result(s).",
+            "Removed {removed} checked; {} item(s) on map; {} result(s).",
             self.items.len(),
             self.results.len()
         );
         self.invalidate_preview();
+    }
+
+    /// Header-checkbox state: true when there is at least one result and
+    /// every result is checked. Checkbox-only state — does not affect the
+    /// render, so it never marks dirty.
+    pub fn all_checked(&self) -> bool {
+        !self.checked.is_empty() && self.checked.iter().all(|&c| c)
+    }
+
+    /// Bulk (un)check every result (the Results header checkbox).
+    /// Checkbox-only state — does not affect the render, so it never
+    /// marks dirty.
+    pub fn set_all_checked(&mut self, v: bool) {
+        self.checked.fill(v);
+    }
+
+    /// Empty the results list (and its checkbox state), leaving the
+    /// items-to-plot untouched. The render is unaffected, so this never
+    /// marks dirty.
+    pub fn clear_results(&mut self) {
+        let n = self.results.len();
+        self.results.clear();
+        self.checked.clear();
+        self.status = format!("Cleared {n} result(s).");
+    }
+
+    /// The item the interiors finder searches for: the first checked
+    /// result, else the first item-to-plot (kept simple by design).
+    fn interiors_target(&self) -> Option<SearchResult> {
+        if let Some(i) = self.checked.iter().position(|&c| c) {
+            return self.results.get(i).cloned();
+        }
+        self.items.first().map(|it| it.result.clone())
+    }
+
+    /// Interiors finder (no C# equivalent — the C# connected-spaces logic
+    /// in `Map.cs:DrawConnectingSpacePlots` only draws door markers onto
+    /// the map): via the teleporters leaving the current space (deduped by
+    /// `(space, teleportsTo)` like the C# path), list the connected CELL
+    /// spaces containing instances of the first checked/added item, with
+    /// per-space counts. Runs synchronously (queries are ms-scale).
+    /// Records [`App::interiors`] for the left-panel section and reports
+    /// the hit count via `status`. Never marks dirty (the render is
+    /// unaffected until a row click switches space).
+    pub fn find_interiors(&mut self) -> Result<(), String> {
+        let result = self
+            .interiors_target()
+            .ok_or_else(|| "Nothing selected: check a result or add an item first.".to_string())?;
+        let editor = result.editor_id().to_string();
+        let path = self
+            .db_path
+            .clone()
+            .ok_or_else(|| "MAPPALACHIA_DB is not set".to_string())?;
+        let conn = db::open_readonly(&path).map_err(|e| format!("DB open failed: {e}"))?;
+        let space = self
+            .spaces
+            .get(self.space_idx)
+            .ok_or_else(|| "No current space.".to_string())?
+            .clone();
+        let teleporters = instances::teleporters(&conn, &space)
+            .map_err(|e| format!("Teleporters failed: {e}"))?;
+        // C# `DistinctBy(i => (i.Space, i.TeleportsTo))`, CELL targets only.
+        let mut seen = std::collections::HashSet::new();
+        let mut targets: Vec<Space> = Vec::new();
+        for t in &teleporters {
+            let dest = match &t.teleports_to {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            if dest.is_worldspace {
+                continue;
+            }
+            if seen.insert((t.space.form_id(), dest.form_id())) {
+                targets.push(dest);
+            }
+        }
+        let mut hits = Vec::new();
+        for dest in &targets {
+            let count = instances::instances(&conn, result.clone(), dest)
+                .map_err(|e| format!("Instances failed: {e}"))?
+                .len();
+            if count == 0 {
+                continue;
+            }
+            if let Some(idx) = self
+                .spaces
+                .iter()
+                .position(|s| s.form_id() == dest.form_id())
+            {
+                hits.push(InteriorHit {
+                    space_idx: idx,
+                    display_name: dest.display_name().to_string(),
+                    count,
+                });
+            }
+        }
+        hits.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.display_name.cmp(&b.display_name))
+        });
+        let n = hits.len();
+        self.interiors = hits;
+        self.interiors_for = editor;
+        self.status = format!("Found {n} interior(s) with instances.");
+        Ok(())
+    }
+
+    /// Switch the current space to `interiors[i]` (a row click in the
+    /// interiors section). Invalidates (marks dirty) since the space feeds
+    /// the render; out-of-range indexes are a no-op.
+    pub fn apply_interior(&mut self, i: usize) {
+        let Some(hit) = self.interiors.get(i) else {
+            return;
+        };
+        let (idx, name) = (hit.space_idx, hit.display_name.clone());
+        self.space_idx = idx;
+        self.invalidate_preview();
+        self.status = format!("Switched to {name}.");
     }
 
     /// Recommended filename stem for the current map (mirrors
@@ -657,10 +807,28 @@ impl App {
 impl App {
     /// Drop any rendered/stale preview: the panel must never show a map
     /// that no longer matches state. Called after every mutation that
-    /// affects the render (items, opened recipe, settings edits).
+    /// affects the render (items, opened recipe, settings edits). Also
+    /// marks the state dirty so auto-render picks it up; the filename
+    /// field never calls this (it does not affect the render).
     fn invalidate_preview(&mut self) {
         self.preview_rx = None;
         self.preview = PreviewState::Idle;
+        self.dirty = true;
+    }
+
+    /// Auto-render hook, called once per frame from `update` after the
+    /// settings-fingerprint diff: when the toggle is on and state mutated
+    /// since the last spawn, start a preview unless one is already
+    /// running. `dirty` is cleared on spawn (not on completion), so a
+    /// finished (`Ready`) or failed preview never re-triggers a loop.
+    pub fn maybe_auto_render(&mut self) {
+        if !self.auto_render || !self.dirty {
+            return;
+        }
+        if matches!(self.preview, PreviewState::Idle | PreviewState::Ready(_)) {
+            self.dirty = false;
+            self.start_preview();
+        }
     }
 
     /// Snapshot of every panel field that feeds [`App::draw_settings`].
@@ -881,7 +1049,13 @@ impl eframe::App for App {
                     }
                 }
                 ui.separator();
-                ui.label(format!("Results ({})", self.results.len()));
+                ui.horizontal(|ui| {
+                    ui.label(format!("Results ({})", self.results.len()));
+                    let mut all = self.all_checked();
+                    if ui.checkbox(&mut all, "all").changed() {
+                        self.set_all_checked(all);
+                    }
+                });
                 egui::ScrollArea::vertical()
                     .max_height(300.0)
                     .show(ui, |ui| {
@@ -896,14 +1070,50 @@ impl eframe::App for App {
                             }
                         }
                     });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Add selected").clicked() {
                         self.add_selected();
                     }
                     if ui.button("Remove checked").clicked() {
                         self.remove_selected();
                     }
+                    if ui.button("Clear results").clicked() {
+                        self.clear_results();
+                    }
                 });
+                ui.separator();
+                if ui.button("Find interiors").clicked() {
+                    if let Err(e) = self.find_interiors() {
+                        self.status = e;
+                    }
+                }
+                egui::CollapsingHeader::new(format!("Interiors ({})", self.interiors.len())).show(
+                    ui,
+                    |ui| {
+                        if self.interiors.is_empty() {
+                            ui.label(format!(
+                                "No interiors yet. Check a result and Find interiors{}.",
+                                if self.interiors_for.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (last: {})", self.interiors_for)
+                                }
+                            ));
+                        }
+                        // Snapshot rows first: the click handler mutates self.
+                        let rows: Vec<(usize, String, usize)> = self
+                            .interiors
+                            .iter()
+                            .enumerate()
+                            .map(|(i, h)| (i, h.display_name.clone(), h.count))
+                            .collect();
+                        for (i, name, count) in rows {
+                            if ui.button(format!("{name} ({count})")).clicked() {
+                                self.apply_interior(i);
+                            }
+                        }
+                    },
+                );
             });
 
         egui::SidePanel::right("settings_panel")
@@ -1026,6 +1236,9 @@ impl eframe::App for App {
         if self.settings_fingerprint() != settings_before {
             self.invalidate_preview();
         }
+        // Auto-render: spawn when dirty (no-op while already rendering or
+        // when the toggle is off — the Render button stays manual).
+        self.maybe_auto_render();
 
         egui::TopBottomPanel::bottom("export_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1078,6 +1291,7 @@ impl eframe::App for App {
                 });
             ui.separator();
             ui.heading("Preview");
+            ui.checkbox(&mut self.auto_render, "Auto render");
             let rendering = matches!(self.preview, PreviewState::Rendering);
             if ui
                 .add_enabled(!rendering, egui::Button::new("Render preview"))
@@ -1639,5 +1853,233 @@ mod tests {
         assert_eq!(app.items.len(), 1);
         assert_eq!(app.results.len(), 1);
         assert_eq!(app.next_group, 1);
+    }
+
+    /// GUI features (1): auto-render toggle.
+    #[test]
+    fn auto_render_defaults_on_and_clean() {
+        let app = settings_app();
+        assert!(app.auto_render, "Auto render defaults ON");
+        assert!(!app.dirty, "fresh state is clean");
+    }
+
+    #[test]
+    fn item_mutations_mark_dirty_filename_does_not() {
+        let mut app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        let item = test_plot_item(&space, 0);
+        app.results = vec![item.result.clone()];
+        app.checked = vec![true];
+        app.add_selected();
+        assert!(app.dirty, "add must mark dirty");
+        app.dirty = false;
+        app.remove_selected();
+        assert!(app.dirty, "remove must mark dirty");
+        // Filename edits never invalidate: excluded from dirty by design.
+        app.dirty = false;
+        let before = app.settings_fingerprint();
+        app.filename = "custom name".to_string();
+        assert_eq!(app.settings_fingerprint(), before);
+        assert!(!app.dirty);
+    }
+
+    /// Fake paths so `start_preview` spawns a worker (which fails fast
+    /// off-thread on the bad DB path) instead of failing synchronously:
+    /// proves the spawn path clears `dirty` without the real DB/assets.
+    fn spawnable_app() -> App {
+        let mut app = settings_app();
+        app.db_path = Some("/nonexistent/mappalachia.db".to_string());
+        app.assets_root = Some("/nonexistent/assets".to_string());
+        app.dirty = true;
+        app
+    }
+
+    #[test]
+    fn maybe_auto_render_spawns_when_dirty_and_idle() {
+        let mut app = spawnable_app();
+        app.maybe_auto_render();
+        assert!(
+            matches!(app.preview, PreviewState::Rendering),
+            "auto + dirty + idle must spawn"
+        );
+        assert!(!app.dirty, "dirty cleared on spawn");
+        assert!(app.preview_rx.is_some());
+    }
+
+    #[test]
+    fn maybe_auto_render_off_keeps_idle_and_dirty() {
+        let mut app = spawnable_app();
+        app.auto_render = false;
+        app.maybe_auto_render();
+        assert!(matches!(app.preview, PreviewState::Idle));
+        assert!(app.dirty, "dirty survives while auto is off");
+        assert!(app.preview_rx.is_none());
+    }
+
+    #[test]
+    fn maybe_auto_render_no_spawn_while_rendering_or_failed() {
+        // No second spawn while a worker runs (no render loops).
+        let mut app = spawnable_app();
+        app.maybe_auto_render();
+        app.dirty = true;
+        app.maybe_auto_render();
+        assert!(matches!(app.preview, PreviewState::Rendering));
+        assert!(app.preview_rx.is_some());
+        // A failed preview with stale dirty never retries on its own.
+        let mut failed = settings_app();
+        failed.preview = PreviewState::Failed("boom".to_string());
+        failed.dirty = true;
+        failed.maybe_auto_render();
+        assert!(matches!(failed.preview, PreviewState::Failed(_)));
+        assert!(failed.preview_rx.is_none());
+    }
+
+    /// GUI features (3): bulk clear.
+    #[test]
+    fn header_checkbox_toggles_all_results() {
+        let mut app = settings_app();
+        assert!(!app.all_checked(), "empty list is not 'all checked'");
+        let space = app.spaces[app.space_idx].clone();
+        app.results = vec![
+            test_plot_item(&space, 0).result,
+            test_plot_item(&space, 1).result,
+            test_plot_item(&space, 2).result,
+        ];
+        app.checked = vec![false, true, false];
+        assert!(!app.all_checked());
+        app.set_all_checked(true);
+        assert!(app.all_checked());
+        assert!(!app.dirty, "checkbox-only state must not mark dirty");
+        app.set_all_checked(false);
+        assert_eq!(app.checked, vec![false; 3]);
+        assert!(!app.all_checked());
+    }
+
+    #[test]
+    fn remove_checked_removes_all_at_once_with_count() {
+        let mut app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        let made: Vec<PlotItem> = (0..3).map(|g| test_plot_item(&space, g)).collect();
+        app.results = made.iter().map(|it| it.result.clone()).collect();
+        app.checked = vec![true, false, true];
+        app.items = vec![made[0].clone(), made[2].clone()];
+        app.remove_selected();
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.checked, vec![false]);
+        assert!(app.items.is_empty());
+        assert!(
+            app.status.contains("Removed 2"),
+            "status must carry the count, got: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn clear_results_empties_list_but_keeps_items() {
+        let mut app = settings_app();
+        let space = app.spaces[app.space_idx].clone();
+        let item = test_plot_item(&space, 0);
+        app.results = vec![item.result.clone()];
+        app.checked = vec![true];
+        app.items = vec![item];
+        app.clear_results();
+        assert!(app.results.is_empty());
+        assert!(app.checked.is_empty());
+        assert_eq!(app.items.len(), 1, "items-to-plot untouched");
+        assert!(!app.dirty, "render unaffected, must stay clean");
+        assert!(app.status.contains("Cleared 1"), "got: {}", app.status);
+    }
+
+    /// GUI features (2): interiors finder needs a selection first (DB-free:
+    /// the selection check runs before any DB open).
+    #[test]
+    fn find_interiors_without_selection_errors() {
+        let mut app = settings_app();
+        let err = app
+            .find_interiors()
+            .expect_err("needs a checked result or item");
+        assert!(err.contains("Nothing selected"), "got: {err}");
+        assert!(app.interiors.is_empty());
+    }
+
+    /// DB-gated interiors finder: probe the first results against the
+    /// first connected CELLs until one hits, then run the finder on it.
+    #[test]
+    fn find_interiors_lists_connected_cells_with_counts() {
+        let Some(mut app) = search_app() else {
+            eprintln!("SKIP: MAPPALACHIA_DB unset");
+            return;
+        };
+        app.run_search().expect("search succeeds");
+        let conn =
+            db::open_readonly(app.db_path.as_deref().expect("db path")).expect("test DB opens");
+        let current = app.spaces[app.space_idx].clone();
+        let teleporters = instances::teleporters(&conn, &current).expect("teleporters load");
+        assert!(
+            !teleporters.is_empty(),
+            "current space needs outgoing teleporters"
+        );
+        // Distinct CELL targets (same dedupe rule as the finder).
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        for t in &teleporters {
+            if let Some(dest) = &t.teleports_to {
+                if !dest.is_worldspace && seen.insert((t.space.form_id(), dest.form_id())) {
+                    targets.push(dest.clone());
+                }
+            }
+        }
+        assert!(
+            !targets.is_empty(),
+            "current space needs connected CELL spaces"
+        );
+        let mut picked: Option<usize> = None;
+        'outer: for (i, r) in app.results.iter().take(8).enumerate() {
+            for dest in targets.iter().take(4) {
+                let n = instances::instances(&conn, r.clone(), dest)
+                    .expect("instances resolve")
+                    .len();
+                if n > 0 {
+                    picked = Some(i);
+                    break 'outer;
+                }
+            }
+        }
+        let Some(i) = picked else {
+            eprintln!("SKIP: no probed result occurs in a connected CELL");
+            return;
+        };
+        let editor = app.results[i].editor_id().to_string();
+        app.checked[i] = true;
+        app.find_interiors().expect("finder succeeds");
+        assert!(!app.interiors.is_empty(), "probed hit must surface");
+        assert_eq!(app.interiors_for, editor);
+        for h in &app.interiors {
+            assert!(h.count > 0);
+            assert!(h.space_idx < app.spaces.len());
+            assert!(
+                !app.spaces[h.space_idx].is_worldspace,
+                "hits must be CELL spaces"
+            );
+        }
+        assert!(
+            app.interiors.windows(2).all(|w| w[0].count >= w[1].count),
+            "hits sorted by count desc"
+        );
+        assert!(app.status.contains("interior"), "got: {}", app.status);
+        assert!(!app.dirty, "finding must not mark dirty");
+        // Row click switches space and invalidates.
+        let (target_idx, target_name) = (
+            app.interiors[0].space_idx,
+            app.interiors[0].display_name.clone(),
+        );
+        app.apply_interior(0);
+        assert_eq!(app.space_idx, target_idx);
+        assert_eq!(app.spaces[app.space_idx].display_name(), target_name);
+        assert!(app.dirty, "space switch affects the render");
+        assert!(matches!(app.preview, PreviewState::Idle));
+        // Out-of-range click is a no-op.
+        app.apply_interior(999);
+        assert_eq!(app.space_idx, target_idx);
     }
 }
