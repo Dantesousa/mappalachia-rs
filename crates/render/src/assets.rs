@@ -31,16 +31,40 @@ pub enum BackgroundKind {
     None,
 }
 
-/// Detect the release layout next to the current executable:
-/// `<exe>/data/mappalachia.db` + `<exe>/img` + `<exe>/font`.
+/// Detect the release layout inside `dir`:
+/// `data/mappalachia.db` + `img` + `font`.
 /// Returns `(db_path, assets_root)` when all three exist.
-pub fn exe_adjacent() -> Option<(PathBuf, PathBuf)> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+/// Pure (no env, no process lookup) so it unit-tests with temp dirs.
+pub fn exe_adjacent_in(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let db = dir.join("data/mappalachia.db");
     if !db.is_file() || !dir.join("img").is_dir() || !dir.join("font").is_dir() {
         return None;
     }
-    Some((db, dir))
+    Some((db, dir.to_path_buf()))
+}
+
+/// Detect the release layout next to the current executable:
+/// `<exe>/data/mappalachia.db` + `<exe>/img` + `<exe>/font`.
+/// Returns `(db_path, assets_root)` when all three exist.
+///
+/// Under an AppImage the runtime sets `$APPIMAGE` to the AppImage file
+/// path while the payload runs from a squashfs mount, so the executable's
+/// own directory never holds the bundled data. When `$APPIMAGE` is set,
+/// its parent directory (where the user extracted the bundle) is tried
+/// FIRST; otherwise the executable's directory is used.
+pub fn exe_adjacent() -> Option<(PathBuf, PathBuf)> {
+    if let Some(appimage) = std::env::var_os("APPIMAGE") {
+        let pb = PathBuf::from(appimage);
+        if let Some(parent) = pb.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Some(hit) = exe_adjacent_in(parent) {
+                    return Some(hit);
+                }
+            }
+        }
+    }
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    exe_adjacent_in(&dir)
 }
 
 /// Asset root handle with raster-image and SVG caches.
@@ -268,5 +292,81 @@ impl Assets {
             &mut pixmap.as_mut(),
         );
         pixmap
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CTR: AtomicU64 = AtomicU64::new(0);
+
+    fn tmpdir() -> PathBuf {
+        let n = CTR.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("mappal-exeadj-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create tmpdir");
+        dir
+    }
+
+    fn make_layout(dir: &Path) {
+        std::fs::create_dir_all(dir.join("data")).expect("create data dir");
+        std::fs::write(dir.join("data/mappalachia.db"), b"test").expect("write db");
+        std::fs::create_dir_all(dir.join("img")).expect("create img dir");
+        std::fs::create_dir_all(dir.join("font")).expect("create font dir");
+    }
+
+    fn cleanup(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn complete_layout_returns_db_and_root() {
+        let dir = tmpdir();
+        make_layout(&dir);
+        let hit = exe_adjacent_in(&dir);
+        assert!(hit.is_some(), "complete layout must match");
+        let (db, root) = hit.unwrap();
+        assert_eq!(db, dir.join("data/mappalachia.db"));
+        assert_eq!(root, dir);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn missing_db_returns_none() {
+        let dir = tmpdir();
+        make_layout(&dir);
+        std::fs::remove_file(dir.join("data/mappalachia.db")).unwrap();
+        assert!(exe_adjacent_in(&dir).is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn missing_img_returns_none() {
+        let dir = tmpdir();
+        make_layout(&dir);
+        std::fs::remove_dir_all(dir.join("img")).unwrap();
+        assert!(exe_adjacent_in(&dir).is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn missing_font_returns_none() {
+        let dir = tmpdir();
+        make_layout(&dir);
+        std::fs::remove_dir_all(dir.join("font")).unwrap();
+        assert!(exe_adjacent_in(&dir).is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn nonexistent_dir_returns_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "mappal-exeadj-missing-{}-{}",
+            std::process::id(),
+            CTR.fetch_add(1, Ordering::SeqCst)
+        ));
+        assert!(!dir.exists());
+        assert!(exe_adjacent_in(&dir).is_none());
     }
 }
