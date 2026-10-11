@@ -17,8 +17,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $rel = gh release list --limit 20 --json tagName | ConvertFrom-Json | Where-Object { $_.tagName -ne $env:GITHUB_REF_NAME } | Select-Object -First 1
-          gh release download $rel.tagName --pattern 'mappalachia-rs-data.zip' --clobber
+          $rel = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=20" | ConvertFrom-Json | Where-Object { -not $_.draft -and ($_.assets | Where-Object { $_.name -eq 'mappalachia-rs-data.zip' }) } | Select-Object -First 1
+          gh release download $rel.tag_name --pattern 'mappalachia-rs-data.zip' --clobber
       - name: Stage bundle
         run: |
           mkdir staging
@@ -60,7 +60,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=$(gh release list --limit 20 --json tagName --jq "[.[] | select(.tagName != \"$GITHUB_REF_NAME\")][0].tagName")
+          TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=20" --jq '[.[] | select(.draft == false) | select([.assets[].name] | index("mappalachia-rs-data.zip"))][0].tag_name')
           gh release download "$TAG" --pattern 'mappalachia-rs-data.zip' --clobber
       - name: Stage and pack Linux bundle
         run: |
