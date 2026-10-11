@@ -148,11 +148,13 @@ fn flux_color_from_index(i: u64) -> Result<FluxColor, String> {
 // ---------------------------------------------------------------------------
 
 /// Formats an RGB color as lowercase HTML hex (`#rrggbb`).
+/// Hex-only output; named colors are never produced.
 pub fn html_color(r: u8, g: u8, b: u8) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
 /// Parses an HTML hex color (`#rrggbb`, case-insensitive); `None` on failure.
+/// Hex-only: named colors like "Red" are not accepted.
 pub fn parse_html_color(s: &str) -> Option<(u8, u8, u8)> {
     let hex = s.strip_prefix('#').unwrap_or(s);
     if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -589,6 +591,7 @@ pub fn load_recipe_file(path: impl AsRef<Path>) -> Result<Recipe, String> {
 // ---------------------------------------------------------------------------
 
 /// Formats a count with thousands separators (`Count.ToString("N0")`).
+/// Hardcodes the en-US comma separator; C# `N0` is culture-dependent.
 fn format_n0(count: i64) -> String {
     let digits: Vec<char> = count.unsigned_abs().to_string().chars().collect();
     let mut out = String::new();
@@ -635,23 +638,23 @@ impl Grouped {
             self.entity.kind,
             EntityKind::DerivedNpc | EntityKind::DerivedScrap | EntityKind::DerivedFlux(_)
         );
+        let mut additional = Vec::new();
         if derived_name {
             builder.push_str(&self.entity.display_name);
         } else {
             builder.push_str(&self.entity.editor_id);
-            let mut additional = Vec::new();
             if !self.entity.display_name.trim().is_empty() {
                 additional.push(format!("\"{}\"", self.entity.display_name));
             }
-            if !self.label.trim().is_empty() {
-                additional.push(self.label.clone());
-            }
-            if self.lock_level_relevant() {
-                additional.push(self.lock_level.to_friendly_name_with_context().to_string());
-            }
-            if !additional.is_empty() {
-                builder.push_str(&format!(" ({})", additional.join(", ")));
-            }
+        }
+        if !self.label.trim().is_empty() {
+            additional.push(self.label.clone());
+        }
+        if self.lock_level_relevant() {
+            additional.push(self.lock_level.to_friendly_name_with_context().to_string());
+        }
+        if !additional.is_empty() {
+            builder.push_str(&format!(" ({})", additional.join(", ")));
         }
 
         match self.entity.kind {

@@ -103,6 +103,24 @@ fn legend_derived_npc_uses_display_name_and_percent() {
 }
 
 #[test]
+fn legend_derived_npc_with_label_and_lock_renders_context() {
+    let space = appalachia();
+    let g = Grouped {
+        entity: Entity::derived_npc("Opossum"),
+        space,
+        count: 1,
+        spawn_weight: 0.5,
+        label: "camp".to_string(),
+        lock_level: LockLevel::Level1,
+        in_container: false,
+    };
+    assert_eq!(
+        g.legend_text(false),
+        "Derived Opossum Spawn (camp, Level 1) [50%]"
+    );
+}
+
+#[test]
 fn legend_derived_scrap_appends_quantity() {
     let space = appalachia();
     let g = Grouped {
