@@ -273,9 +273,10 @@ impl Signature {
     }
 
     /// Default selected signatures (used by Task 5 tests).
-    /// Exact list per the Task 2 brief.
+    /// Exact list per C# IsRecommendedSelection (ACTI first); Task 2 brief omitted Acti by error.
     pub fn recommended_default() -> Vec<Signature> {
         [
+            Signature::Acti,
             Signature::Lvli,
             Signature::Flora,
             Signature::Npc,
@@ -571,7 +572,7 @@ mod tests {
         );
         assert!("Level 0".parse::<LockLevel>().is_err());
         assert_eq!(LockLevel::all().len(), 11);
-        assert_eq!(Signature::recommended_default().len(), 19);
+        assert_eq!(Signature::recommended_default().len(), 20);
         // FluxColor / ShapeType parse + display.
         assert_eq!("Violet".parse::<FluxColor>().unwrap(), FluxColor::Violet);
         assert_eq!(FluxColor::Yellowcake.to_string(), "Yellowcake");

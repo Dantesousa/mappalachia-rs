@@ -158,12 +158,12 @@ Expected: FAIL, `enums.rs` doesn't exist.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Port `Library/Entity.cs` (Signature, 34 variants), `Library/BaseInstance.cs` (LockLevel, 11 variants), `Library/Common.cs` (FluxColor: Crimson, Cobalt, Fluorescent, Violet, Yellowcake), `Library/Shape.cs` (ShapeType: Box, Sphere, Line, Plane, Ellipsoid, Cylinder), and all `DataTranslator.cs` mappings verbatim. Rust variant names must be valid identifiers: `NPC_`→`Npc`, `LVLI`→`Lvli`, etc. `parse` accepts the exact C# enum names (`"NPC_"`, `"LVLI"`, `"RequiresTerminal"`…). LockLevel friendly names verbatim ("Level 0", "Requires Key", "Not Locked" for `to_friendly_name_with_context` on None). Signature friendly names + descriptions verbatim from DataTranslator (34 entries each).
+Port `Library/Entity.cs` (Signature, 35 variants), `Library/BaseInstance.cs` (LockLevel, 11 variants), `Library/Common.cs` (FluxColor: Crimson, Cobalt, Fluorescent, Violet, Yellowcake), `Library/Shape.cs` (ShapeType: Box, Sphere, Line, Plane, Ellipsoid, Cylinder), and all `DataTranslator.cs` mappings verbatim. Rust variant names must be valid identifiers: `NPC_`→`Npc`, `LVLI`→`Lvli`, etc. `parse` accepts the exact C# enum names (`"NPC_"`, `"LVLI"`, `"RequiresTerminal"`…). LockLevel friendly names verbatim ("Level 0", "Requires Key", "Not Locked" for `to_friendly_name_with_context` on None). Signature friendly names + descriptions verbatim from DataTranslator (35 entries each).
 
 ```rust
-// crates/core/src/enums.rs (shape; fill all 34 signatures + 11 lock levels)
+// crates/core/src/enums.rs (shape; fill all 35 signatures + 11 lock levels)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum Signature { Lvli, Flora, Npc, Misc, Book, Alch, Container, Stat, Scol, Mstt, Furn, Note, Term, Armo, Weapon, Ammo, Proj, Currency, Key, Region, Location, Acti, Tact, Trap, Door, Hazd, Idlm, Light, Sech, Aspc, Txst, Bnds, World, Cell }
+pub enum Signature { Lvli, Flora, Npc, Misc, Book, Alch, Container, Stat, Scol, Mstt, Furn, Note, Term, Armo, Weapon, Ammo, Proj, Currency, Key, Region, Location, Acti, Tact, Trap, Door, Hazd, Idlm, Light, Soun, Sech, Aspc, Txst, Bnds, World, Cell }
 
 impl std::str::FromStr for Signature {
     type Err = String;
@@ -191,7 +191,7 @@ impl std::str::FromStr for Signature {
 impl Signature {
     /// Mirrors `Enum.GetValues<Signature>().Where(s => s.IsRecommendedSelection())`.
     pub fn recommended_default() -> Vec<Signature> {
-        [Signature::Lvli, Signature::Flora, Signature::Npc, Signature::Misc, Signature::Book,
+        [Signature::Acti, Signature::Lvli, Signature::Flora, Signature::Npc, Signature::Misc, Signature::Book,
          Signature::Alch, Signature::Ammo, Signature::Armo, Signature::Currency, Signature::Container,
          Signature::Furn, Signature::Key, Signature::Region, Signature::Location, Signature::Term,
          Signature::Trap, Signature::Proj, Signature::Note, Signature::Weapon].to_vec()
