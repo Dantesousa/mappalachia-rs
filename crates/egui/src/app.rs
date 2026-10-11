@@ -4,7 +4,14 @@ use mappalachia_core::{
     model::{EntityKind, Space},
     search::{search, Grouped, SearchParams, SearchResult},
 };
-use mappalachia_render::{color::Rgba, icon::PlotIcon, settings::PlotStyleSettings};
+use mappalachia_render::{
+    color::Rgba,
+    icon::PlotIcon,
+    settings::{
+        BackgroundImageType, CompassStyle, LegendHorizontalAlignment, LegendStyle,
+        LegendVerticalAlignment, MapSettings, PlotMode, PlotSettings, PlotStyleSettings,
+    },
+};
 
 /// `FileIO.GetAvailablePlotIconCount`: the release tree ships 7 base icons
 /// (`A.png..G.png`; cf. `render::icon::PlotIcon::assign` docs).
@@ -40,6 +47,50 @@ pub struct App {
     /// Next fresh legend group for `add_selected` (non-grouped path: one
     /// fresh group per added item).
     pub next_group: usize,
+    /// Map background (`MapSettings.BackgroundImage`; C# default `Menu`).
+    pub background: BackgroundImageType,
+    /// Map brightness (`MapSettings.Brightness`; C# default 0.5, setter
+    /// clamps to 0.1–2.0).
+    pub brightness: f32,
+    /// Map title (`MapSettings.Title`; C# default `""`).
+    pub title: String,
+    /// Legend style/alignments (C# defaults Compact/Right/Center).
+    pub legend_style: LegendStyle,
+    pub legend_halign: LegendHorizontalAlignment,
+    pub legend_valign: LegendVerticalAlignment,
+    /// Compass style (C# default `WhenUseful`).
+    pub compass: CompassStyle,
+    /// `MapSettings.ShowCoordinateGrid` (C# default off).
+    pub show_grid: bool,
+    /// Drives both `MapMarkerIcons` and `MapMarkerLabels` (C# defaults off;
+    /// v1 exposes a single markers toggle).
+    pub show_markers: bool,
+    /// `MapSettings.ShowInfestations` (C# default off).
+    pub show_infestations: bool,
+    /// Plot style (C# defaults: size 50, 8-color palette); display-only in
+    /// v1, editable in a later task.
+    pub plot_style: PlotStyleSettings,
+    /// `PlotSettings.Mode`, locked to `Standard` until the modes plan
+    /// (other modes appear greyed with "(soon)" in the combo).
+    pub plot_mode: PlotMode,
+}
+
+/// Typed draw inputs resolved from [`App`] UI state (cf. C#
+/// `Recipe.AsSettings` minus recipe I/O): the stored full-DB [`Space`]
+/// (cloned from `spaces`, never a recipe stub — `populate_from_data` is
+/// only needed for opened recipes, Task 5) plus the typed
+/// [`MapSettings`]/[`PlotSettings`].
+///
+/// There is no `render::settings::Settings` root type (the render crate
+/// deliberately did not port C# `Settings.cs`: its `Space` setter is
+/// DB-coupled), so this local struct is the conversion target. Consumed by
+/// the Task 4 preview worker; until then it is only exercised by tests.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DrawSettings {
+    pub space: Space,
+    pub map: MapSettings,
+    pub plot: PlotSettings,
 }
 
 impl App {
@@ -84,7 +135,49 @@ impl App {
             checked: Vec::new(),
             items: Vec::new(),
             next_group: 0,
+            background: BackgroundImageType::Menu,
+            brightness: 0.5,
+            title: String::new(),
+            legend_style: LegendStyle::Compact,
+            legend_halign: LegendHorizontalAlignment::Right,
+            legend_valign: LegendVerticalAlignment::Center,
+            compass: CompassStyle::WhenUseful,
+            show_grid: false,
+            show_markers: false,
+            show_infestations: false,
+            plot_style: PlotStyleSettings::default(),
+            plot_mode: PlotMode::Standard,
         }
+    }
+
+    /// Resolve the UI state into typed draw inputs: the stored full-DB
+    /// [`Space`] plus [`MapSettings`]/[`PlotSettings`] built from the panel
+    /// state (all other typed fields keep their C# defaults). Brightness is
+    /// clamped to 0.1–2.0 like the C# setter. Returns `None` when no spaces
+    /// are loaded (DB path unset or unreadable).
+    #[allow(dead_code)]
+    pub fn draw_settings(&self) -> Option<DrawSettings> {
+        let space = self.spaces.get(self.space_idx)?.clone();
+        let map = MapSettings {
+            background_image: self.background,
+            brightness: self.brightness.clamp(0.1, 2.0),
+            title: self.title.clone(),
+            legend_style: self.legend_style,
+            legend_horizontal_alignment: self.legend_halign,
+            legend_vertical_alignment: self.legend_valign,
+            compass_style: self.compass,
+            show_coordinate_grid: self.show_grid,
+            map_marker_icons: self.show_markers,
+            map_marker_labels: self.show_markers,
+            show_infestations: self.show_infestations,
+            ..MapSettings::default()
+        };
+        let plot = PlotSettings {
+            mode: self.plot_mode,
+            plot_style_settings: self.plot_style.clone(),
+            ..PlotSettings::default()
+        };
+        Some(DrawSettings { space, map, plot })
     }
 
     /// Mirrors the `FormMain` search flow: `core::search` with the default
@@ -294,6 +387,121 @@ impl eframe::App for App {
                 });
             });
 
+        egui::SidePanel::right("settings_panel")
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("Map");
+                egui::ComboBox::from_label("Background")
+                    .selected_text(format!("{:?}", self.background))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.background,
+                            BackgroundImageType::Render,
+                            "Render",
+                        );
+                        ui.selectable_value(
+                            &mut self.background,
+                            BackgroundImageType::Menu,
+                            "Menu",
+                        );
+                        ui.selectable_value(
+                            &mut self.background,
+                            BackgroundImageType::Military,
+                            "Military",
+                        );
+                        ui.selectable_value(
+                            &mut self.background,
+                            BackgroundImageType::None,
+                            "None",
+                        );
+                    });
+                ui.add(egui::Slider::new(&mut self.brightness, 0.1..=2.0).text("Brightness"));
+                ui.horizontal(|ui| {
+                    ui.label("Title:");
+                    ui.text_edit_singleline(&mut self.title);
+                });
+                egui::ComboBox::from_label("Legend")
+                    .selected_text(format!("{:?}", self.legend_style))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.legend_style,
+                            LegendStyle::Extended,
+                            "Extended",
+                        );
+                        ui.selectable_value(
+                            &mut self.legend_style,
+                            LegendStyle::Compact,
+                            "Compact",
+                        );
+                        ui.selectable_value(&mut self.legend_style, LegendStyle::Hidden, "Hidden");
+                    });
+                egui::ComboBox::from_label("Legend align")
+                    .selected_text(format!(
+                        "{:?} / {:?}",
+                        self.legend_halign, self.legend_valign
+                    ))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.legend_halign,
+                            LegendHorizontalAlignment::Left,
+                            "Left",
+                        );
+                        ui.selectable_value(
+                            &mut self.legend_halign,
+                            LegendHorizontalAlignment::Right,
+                            "Right",
+                        );
+                        ui.selectable_value(
+                            &mut self.legend_valign,
+                            LegendVerticalAlignment::Top,
+                            "Top",
+                        );
+                        ui.selectable_value(
+                            &mut self.legend_valign,
+                            LegendVerticalAlignment::Center,
+                            "Center",
+                        );
+                        ui.selectable_value(
+                            &mut self.legend_valign,
+                            LegendVerticalAlignment::Bottom,
+                            "Bottom",
+                        );
+                    });
+                egui::ComboBox::from_label("Compass")
+                    .selected_text(format!("{:?}", self.compass))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.compass, CompassStyle::Off, "Off");
+                        ui.selectable_value(
+                            &mut self.compass,
+                            CompassStyle::WhenUseful,
+                            "WhenUseful",
+                        );
+                        ui.selectable_value(&mut self.compass, CompassStyle::Always, "Always");
+                    });
+                ui.checkbox(&mut self.show_grid, "Coordinate grid");
+                ui.checkbox(&mut self.show_markers, "Map markers");
+                ui.checkbox(&mut self.show_infestations, "Infestations");
+                ui.separator();
+                ui.heading("Plot");
+                // Standard-locked until the modes plan: the other modes are
+                // visible but disabled, with no code paths behind them.
+                egui::ComboBox::from_label("Mode")
+                    .selected_text(format!("{:?}", self.plot_mode))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.plot_mode, PlotMode::Standard, "Standard");
+                        for soon in ["Topographic (soon)", "Heatmap (soon)", "Cluster (soon)"] {
+                            ui.add_enabled(false, egui::Button::selectable(false, soon));
+                        }
+                    });
+                ui.label(format!("Plot size: {}", self.plot_style.size));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Palette:");
+                    for c in &self.plot_style.palette {
+                        ui.colored_label(egui::Color32::from_rgb(c.r, c.g, c.b), "\u{25a0}");
+                    }
+                });
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Mappalachia RS");
             ui.label(&self.status);
@@ -319,7 +527,6 @@ impl eframe::App for App {
                     }
                 });
             ui.separator();
-            ui.label("Preview panel (Task 3): pending");
             ui.label("Plot panel (Task 4): pending");
             ui.label("Export panel (Task 5): pending");
         });
@@ -453,5 +660,64 @@ mod tests {
         assert!(app.items.is_empty());
         assert_eq!(app.results.len(), n - 1);
         assert_eq!(app.checked.len(), n - 1);
+    }
+
+    /// Task 3 RED: settings state mirroring the C# defaults
+    /// (`Settings/MapSettings.cs`, `PlotSettings.cs`,
+    /// `PlotStyleSettings.cs`).
+    fn settings_app() -> App {
+        let space = Space::new(
+            0x0000_0001,
+            "APPALACHIA",
+            "Appalachia",
+            true,
+            true,
+            0.0,
+            0.0,
+            100000.0,
+            0.0,
+        );
+        App::from_parts(None, None, vec![space])
+    }
+
+    #[test]
+    fn settings_defaults_match_csharp() {
+        let app = settings_app();
+        assert_eq!(app.background, BackgroundImageType::Menu);
+        assert_eq!(app.brightness, 0.5);
+        assert!(app.title.is_empty());
+        assert_eq!(app.legend_style, LegendStyle::Compact);
+        assert_eq!(app.legend_halign, LegendHorizontalAlignment::Right);
+        assert_eq!(app.legend_valign, LegendVerticalAlignment::Center);
+        assert_eq!(app.compass, CompassStyle::WhenUseful);
+        assert!(!app.show_grid);
+        assert!(!app.show_markers);
+        assert!(!app.show_infestations);
+        assert_eq!(app.plot_style.size, 50);
+        assert_eq!(app.plot_style.palette.len(), 8);
+        assert_eq!(app.plot_mode, PlotMode::Standard);
+    }
+
+    #[test]
+    fn draw_settings_conversion_matches_csharp_and_clamps_brightness() {
+        let mut app = settings_app();
+        app.title = "Nuka map".to_string();
+        app.brightness = 9.0;
+        app.show_grid = true;
+        let ds = app.draw_settings().expect("spaces present");
+        assert_eq!(ds.map.background_image, BackgroundImageType::Menu);
+        assert_eq!(ds.plot.mode, PlotMode::Standard);
+        assert_eq!(ds.map.brightness, 2.0);
+        assert_eq!(ds.map.title, "Nuka map");
+        assert!(ds.map.show_coordinate_grid);
+        assert_eq!(ds.space, app.spaces[app.space_idx]);
+        app.brightness = -3.0;
+        assert_eq!(app.draw_settings().unwrap().map.brightness, 0.1);
+    }
+
+    #[test]
+    fn draw_settings_none_without_spaces() {
+        let app = App::from_parts(None, None, Vec::new());
+        assert!(app.draw_settings().is_none());
     }
 }
