@@ -16,7 +16,9 @@ jobs:
       - name: Fetch game data bundle
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download --pattern 'mappalachia-rs-data.zip' --clobber
+        run: |
+          $rel = gh release list --limit 20 --json tagName | ConvertFrom-Json | Where-Object { $_.tagName -ne $env:GITHUB_REF_NAME } | Select-Object -First 1
+          gh release download $rel.tagName --pattern 'mappalachia-rs-data.zip' --clobber
       - name: Stage bundle
         run: |
           mkdir staging
@@ -57,7 +59,9 @@ jobs:
       - name: Fetch game data bundle
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download --pattern 'mappalachia-rs-data.zip' --clobber
+        run: |
+          TAG=$(gh release list --limit 20 --json tagName --jq "[.[] | select(.tagName != \"$GITHUB_REF_NAME\")][0].tagName")
+          gh release download "$TAG" --pattern 'mappalachia-rs-data.zip' --clobber
       - name: Stage and pack Linux bundle
         run: |
           mkdir -p staging
