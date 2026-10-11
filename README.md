@@ -1,5 +1,9 @@
 # mappalachia-rs
 
+[![release](https://github.com/Dantesousa/mappalachia-rs/actions/workflows/release.yml/badge.svg)](https://github.com/Dantesousa/mappalachia-rs/actions/workflows/release.yml)
+[![latest release](https://img.shields.io/github/v/release/Dantesousa/mappalachia-rs)](https://github.com/Dantesousa/mappalachia-rs/releases/latest)
+[![license](https://img.shields.io/github/license/Dantesousa/mappalachia-rs)](LICENSE.md)
+
 A Rust port of [Mappalachia](https://github.com/AHeroicLlama/Mappalachia) — the mapping tool for Fallout 76.
 Generates and exports maps of entities in the Fallout 76 game world.
 
