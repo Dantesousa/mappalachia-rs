@@ -150,6 +150,30 @@ pub struct App {
     /// an invalid rect); the Reset-view button restores it. Never touches
     /// the Render/texture flow — it only re-frames the uploaded texture.
     pub scene_rect: egui::Rect,
+    /// Pop-out map window flag: while true `update` opens the preview in
+    /// a second native OS window (eframe immediate viewport, see
+    /// [`App::show_map_window`]). Closing via X or the toggle returns to
+    /// single-window without losing preview state.
+    pub map_window_open: bool,
+    /// Render generation of the current preview: bumped once per
+    /// successful worker upload in [`App::poll_preview`]. The map window
+    /// re-uploads its own viewport texture only when its generation lags
+    /// (never per frame).
+    pub preview_generation: u64,
+    /// Straight-alpha RGBA bytes of the current preview generation
+    /// (`4096*4096*4`), retained so the map window can re-upload them in
+    /// its own viewport context. `None` when no preview exists.
+    pub preview_bytes: Option<Vec<u8>>,
+    /// Last preview generation uploaded into the map window viewport.
+    /// Equal to [`App::preview_generation`] means up to date.
+    pub map_window_gen: u64,
+    /// Map-window viewport texture, uploaded in that viewport's context
+    /// once per render generation. `None` until the first upload or after
+    /// [`App::close_map_window`].
+    pub map_window_tex: Option<egui::TextureHandle>,
+    /// Independent pan/zoom view for the map window `egui::Scene`, so the
+    /// two windows never fight over one rect. `Rect::ZERO` = fit to view.
+    pub map_scene_rect: egui::Rect,
     /// Auto-render toggle (default ON): when set, [`App::maybe_auto_render`]
     /// spawns a preview on the next frame after any render-affecting
     /// mutation. The Render button always works manually when off.
@@ -272,6 +296,12 @@ impl App {
             preview: PreviewState::Idle,
             preview_rx: None,
             scene_rect: egui::Rect::ZERO,
+            map_window_open: false,
+            preview_generation: 0,
+            preview_bytes: None,
+            map_window_gen: 0,
+            map_window_tex: None,
+            map_scene_rect: egui::Rect::ZERO,
             auto_render: true,
             dirty: false,
             interiors: Vec::new(),
@@ -368,6 +398,7 @@ impl App {
                 self.preview_rx = None;
                 let side = MAP_IMAGE_RESOLUTION as usize;
                 if bytes.len() != side * side * 4 {
+                    self.preview_bytes = None;
                     self.preview = PreviewState::Failed(format!(
                         "Preview bytes corrupt ({} != {}).",
                         bytes.len(),
@@ -378,16 +409,19 @@ impl App {
                 }
                 let img = egui::ColorImage::from_rgba_unmultiplied([side, side], &bytes);
                 let tex = ctx.load_texture("preview", img, Default::default());
+                self.store_preview_bytes(bytes);
                 self.preview = PreviewState::Ready(tex);
                 self.status = "Preview ready.".to_string();
             }
             Outcome::Got(Err(e)) => {
                 self.preview_rx = None;
+                self.preview_bytes = None;
                 self.status = e.clone();
                 self.preview = PreviewState::Failed(e);
             }
             Outcome::Disconnected => {
                 self.preview_rx = None;
+                self.preview_bytes = None;
                 let msg = "Preview worker died.".to_string();
                 self.status = msg.clone();
                 self.preview = PreviewState::Failed(msg);
@@ -903,7 +937,49 @@ impl App {
     fn invalidate_preview(&mut self) {
         self.preview_rx = None;
         self.preview = PreviewState::Idle;
+        self.preview_bytes = None;
         self.dirty = true;
+        // Drop the map-window copy too so a stale 67MB GPU texture
+        // does not linger after invalidation (it re-uploads on reopen).
+        self.map_window_tex = None;
+        self.map_window_gen = 0;
+    }
+
+    /// Retain a finished render's bytes and bump the generation counter.
+    /// Called once per successful worker upload by [`App::poll_preview`];
+    /// the map window re-uploads from these bytes in its own context.
+    /// State-level (no `Context`), so tests drive it directly.
+    fn store_preview_bytes(&mut self, bytes: Vec<u8>) {
+        self.preview_bytes = Some(bytes);
+        self.preview_generation += 1;
+    }
+
+    /// Open the pop-out map window (the `Map window` toggle / button).
+    pub fn open_map_window(&mut self) {
+        self.map_window_open = true;
+    }
+
+    /// Close the pop-out map window: drops the viewport texture and resets
+    /// the upload generation so a reopen re-uploads the current preview.
+    /// Main-window preview state is untouched.
+    pub fn close_map_window(&mut self) {
+        self.map_window_open = false;
+        self.map_window_tex = None;
+        self.map_window_gen = 0;
+    }
+
+    /// True when the map window is open and lags the current preview
+    /// generation. The viewport re-uploads exactly then — never per frame.
+    pub fn map_window_needs_upload(&self) -> bool {
+        self.map_window_open
+            && self.preview_bytes.is_some()
+            && self.map_window_gen != self.preview_generation
+    }
+
+    /// Record a completed map-window upload (viewport texture is current).
+    /// Called right after re-uploading in the viewport callback.
+    pub fn note_map_window_uploaded(&mut self) {
+        self.map_window_gen = self.preview_generation;
     }
 
     /// Auto-render hook, called once per frame from `update` after the
@@ -1472,6 +1548,18 @@ impl eframe::App for App {
             {
                 self.start_preview();
             }
+            // Pop-out second-window toggle: closing resets the viewport
+            // upload state so a reopen re-uploads the current preview.
+            let was_open = self.map_window_open;
+            let mut open = was_open;
+            ui.checkbox(&mut open, "Map window");
+            if open != was_open {
+                if open {
+                    self.open_map_window();
+                } else {
+                    self.close_map_window();
+                }
+            }
             match &self.preview {
                 PreviewState::Idle => {
                     ui.label("Preview idle. Add items, then Render preview.");
@@ -1503,6 +1591,108 @@ impl eframe::App for App {
                 }
             }
         });
+        if self.map_window_open {
+            self.show_map_window(ctx);
+        }
+    }
+}
+
+impl App {
+    /// Open the pop-out preview in a second native OS window.
+    ///
+    /// Viewport choice: eframe 0.32 `show_viewport_immediate` (not
+    /// deferred). Deferred requires a `Send + Sync + 'static` callback, so
+    /// the `App` would need `Arc<Mutex<..>>` wrapping; immediate takes
+    /// `FnMut` and borrows `&mut self` directly, matching this
+    /// single-struct `App`. The parent+child repaint coupling it implies
+    /// is irrelevant for a static map image. Called every frame while
+    /// [`App::map_window_open`]; an X-close is observed via
+    /// `close_requested` and resets to single-window state.
+    fn show_map_window(&mut self, ctx: &egui::Context) {
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("mappalachia-map-window"),
+            egui::ViewportBuilder::default()
+                .with_title("Map window")
+                .with_inner_size([800.0, 800.0]),
+            |child_ctx, class| {
+                if child_ctx.input(|i| i.viewport().close_requested()) {
+                    self.close_map_window();
+                    return;
+                }
+                if class == egui::ViewportClass::Embedded {
+                    // Single-window fallback (backend without viewports):
+                    // embed as a closable window in the parent context.
+                    let mut open = self.map_window_open;
+                    egui::Window::new("Map window")
+                        .open(&mut open)
+                        .show(child_ctx, |ui| {
+                            self.map_window_contents(ui, child_ctx);
+                        });
+                    if !open {
+                        self.close_map_window();
+                    }
+                } else {
+                    egui::CentralPanel::default().show(child_ctx, |ui| {
+                        self.map_window_contents(ui, child_ctx);
+                    });
+                }
+            },
+        );
+    }
+
+    /// Draw the map-window body in its own viewport context: the same
+    /// current preview image (re-uploaded here once per render generation,
+    /// never per frame), or the status text when no preview exists. The
+    /// main-window preview flow is untouched.
+    fn map_window_contents(&mut self, ui: &mut egui::Ui, vctx: &egui::Context) {
+        ui.heading("Map window");
+        if self.map_window_needs_upload() {
+            if let Some(bytes) = self.preview_bytes.as_ref() {
+                let side = MAP_IMAGE_RESOLUTION as usize;
+                if bytes.len() == side * side * 4 {
+                    let img = egui::ColorImage::from_rgba_unmultiplied([side, side], bytes);
+                    let tex = vctx.load_texture("preview-map-window", img, Default::default());
+                    self.map_window_tex = Some(tex);
+                    self.note_map_window_uploaded();
+                }
+            }
+        }
+        let ready = matches!(self.preview, PreviewState::Ready(_))
+            && self.map_window_tex.is_some()
+            && self.map_window_gen == self.preview_generation;
+        if ready {
+            ui.horizontal(|ui| {
+                ui.label("Drag to pan, scroll to zoom.");
+                // Independent view: only re-frames this window's texture.
+                if ui.button("Reset view").clicked() {
+                    self.map_scene_rect = egui::Rect::ZERO;
+                }
+            });
+            let native = self.map_window_tex.as_ref().expect("checked").size_vec2();
+            let tex = self.map_window_tex.as_ref().expect("checked");
+            egui::Scene::new()
+                .zoom_range(egui::Rangef::new(0.0, 8.0))
+                .max_inner_size(native + egui::Vec2::splat(32.0))
+                .show(ui, &mut self.map_scene_rect, |ui| {
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(native));
+                });
+        } else {
+            match &self.preview {
+                PreviewState::Idle => {
+                    ui.label("Preview idle. Add items, then Render preview.");
+                }
+                PreviewState::Rendering => {
+                    ui.label("Rendering...");
+                }
+                PreviewState::Ready(_) => {
+                    ui.label("Preparing map window...");
+                }
+                PreviewState::Failed(e) => {
+                    ui.label(format!("Preview failed: {e}"));
+                }
+            }
+            ui.label(self.status.clone());
+        }
     }
 }
 
@@ -2455,6 +2645,87 @@ mod tests {
             row.count(),
             raw.iter().map(|r| r.count()).sum::<i64>(),
             "row count must sum the raw counts"
+        );
+    }
+
+    /// Pop-out map window (state-level, no event loop): flag defaults,
+    /// generation bump on new render, upload-once tracking, close resets.
+    #[test]
+    fn map_window_defaults_closed_clean() {
+        let app = settings_app();
+        assert!(!app.map_window_open, "map window starts closed");
+        assert_eq!(app.preview_generation, 0);
+        assert!(app.preview_bytes.is_none());
+        assert_eq!(app.map_window_gen, 0);
+        assert!(app.map_window_tex.is_none());
+        assert_eq!(app.map_scene_rect, egui::Rect::ZERO);
+        assert!(
+            !app.map_window_needs_upload(),
+            "nothing to upload while closed"
+        );
+    }
+
+    #[test]
+    fn map_window_open_bump_upload_close_resets() {
+        let mut app = settings_app();
+        app.open_map_window();
+        assert!(app.map_window_open);
+        assert!(
+            !app.map_window_needs_upload(),
+            "no bytes yet, no upload pending"
+        );
+        // First render generation: exactly one upload pending.
+        app.store_preview_bytes(vec![1, 2, 3, 4]);
+        assert_eq!(app.preview_generation, 1);
+        assert!(app.map_window_needs_upload());
+        // Upload done: no re-upload until the next generation (never per
+        // frame).
+        app.note_map_window_uploaded();
+        assert!(
+            !app.map_window_needs_upload(),
+            "current generation must not re-upload"
+        );
+        // Second render generation: one more upload, then quiet again.
+        app.store_preview_bytes(vec![5, 6, 7, 8]);
+        assert_eq!(app.preview_generation, 2);
+        assert!(app.map_window_needs_upload());
+        app.note_map_window_uploaded();
+        assert!(!app.map_window_needs_upload());
+        // Close (X or toggle) resets to single-window without losing the
+        // main preview bytes/generation.
+        app.close_map_window();
+        assert!(!app.map_window_open);
+        assert!(app.map_window_tex.is_none());
+        assert_eq!(app.map_window_gen, 0);
+        assert!(
+            !app.map_window_needs_upload(),
+            "closed window never uploads"
+        );
+        assert!(app.preview_bytes.is_some(), "main preview bytes kept");
+        assert_eq!(app.preview_generation, 2, "main generation kept");
+    }
+
+    #[test]
+    fn map_window_closed_never_needs_upload() {
+        let mut app = settings_app();
+        app.store_preview_bytes(vec![9]);
+        assert!(
+            !app.map_window_needs_upload(),
+            "closed window ignores new renders"
+        );
+    }
+
+    #[test]
+    fn invalidate_preview_clears_bytes_for_map_window() {
+        let mut app = settings_app();
+        app.open_map_window();
+        app.store_preview_bytes(vec![1]);
+        assert!(app.map_window_needs_upload());
+        app.invalidate_preview();
+        assert!(app.preview_bytes.is_none());
+        assert!(
+            !app.map_window_needs_upload(),
+            "stale bytes must not reach the map window"
         );
     }
 }
