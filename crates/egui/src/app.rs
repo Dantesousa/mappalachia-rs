@@ -263,6 +263,12 @@ impl App {
             Outcome::Got(Ok(bytes)) => {
                 self.preview_rx = None;
                 let side = MAP_IMAGE_RESOLUTION as usize;
+                if bytes.len() != side * side * 4 {
+                    self.preview = PreviewState::Failed(format!(
+                        "Preview bytes corrupt ({} != {}).", bytes.len(), side * side * 4));
+                    self.status = "Preview bytes corrupt.".to_string();
+                    return;
+                }
                 let img = egui::ColorImage::from_rgba_unmultiplied([side, side], &bytes);
                 let tex = ctx.load_texture("preview", img, Default::default());
                 self.preview = PreviewState::Ready(tex);
