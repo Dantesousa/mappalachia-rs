@@ -80,6 +80,7 @@ pub fn background_rect() -> (f32, f32, f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mappalachia_core::model::Space;
     #[test]
     fn center_maps_to_center() {
         let v = View {
@@ -104,11 +105,71 @@ mod tests {
             center_y: 135.0,
             factor: 582550.0 / 4096.0,
         };
+        let space = Space::new(
+            2480661,
+            "APPALACHIA",
+            "Appalachia",
+            true,
+            true,
+            -500.0,
+            135.0,
+            582550.0,
+            0.0,
+        );
         let (x, y, w, h) = image_rect_of_world(&v, -500.0, 135.0, v.factor, v.factor);
         assert_eq!((x, y, w, h), (2048.0, 2048.0, 1.0, 1.0));
         let (wx, wy, ww, wh) = world_rect_of_image(&v, 2048.0, 2048.0, 1.0, 1.0);
         assert!((wx + 500.0).abs() < 1.0 && (wy - 135.0).abs() < 1.0);
         assert!((ww - v.factor).abs() < 1.0 && (wh - v.factor).abs() < 1.0);
-        assert_eq!(background_rect(), (0.0, 0.0, 4096.0, 4096.0));
+        assert_eq!(
+            background_rect(&space, None),
+            (0.0, 0.0, 4096.0, 4096.0)
+        );
+    }
+    #[test]
+    fn spot_factor_size_two() {
+        // C# GetWorldToImageFactor spotlight branch: size_tiles * TILE_WIDTH / 4096.
+        let spot = spot_view((1000.0, 2000.0), 2.0);
+        assert_eq!(spot.factor, 2.0 * 8192.0 / 4096.0);
+        assert_eq!(spot.factor, 4.0);
+        assert_eq!((spot.center_x, spot.center_y), (1000.0, 2000.0));
+    }
+    #[test]
+    fn spot_center_maps_to_center() {
+        let spot = spot_view((1000.0, 2000.0), 2.0);
+        assert_eq!(world_to_image(&spot, 1000.0, 2000.0), (2048.0, 2048.0));
+        // one spot factor east -> +1px, same Y-flip rule as the full-canvas view
+        assert_eq!(
+            world_to_image(&spot, 1000.0 + spot.factor, 2000.0),
+            (2049.0, 2048.0)
+        );
+        let (px, py) = world_to_image(&spot, 1500.0, 2500.0);
+        let (wx, wy) = image_to_world(&spot, px, py);
+        assert!((wx - 1500.0).abs() < 1.0 && (wy - 2500.0).abs() < 1.0);
+    }
+    #[test]
+    fn spot_background_rect_appalachia_zoomed() {
+        // Appalachia (DB row 2480661): center (-500, 135), range 582550.
+        let space = Space::new(
+            2480661,
+            "APPALACHIA",
+            "Appalachia",
+            true,
+            true,
+            -500.0,
+            135.0,
+            582550.0,
+            0.0,
+        );
+        // Spotlight on the space center, 2 tiles wide -> factor 4.0.
+        let spot = spot_view((-500.0, 135.0), 2.0);
+        // Hand-computed AsImageRectangle of the space rect
+        // (left -291775, top 291410, 582550 x 582550) at factor 4.0:
+        // x = (-291775 + 500)/4 + 2048 = -70770.75, w = 582550/4 = 145637.5.
+        let (x, y, w, h) = background_rect(&space, Some(&spot));
+        assert!((x + 70770.75).abs() < 0.01, "x = {x}");
+        assert!((y + 70770.75).abs() < 0.01, "y = {y}");
+        assert!((w - 145637.5).abs() < 0.01, "w = {w}");
+        assert!((h - 145637.5).abs() < 0.01, "h = {h}");
     }
 }
