@@ -42,8 +42,9 @@
 
 use std::str::FromStr;
 
+use mappalachia_core::common::{SPOTLIGHT_MAX_SIZE, SPOTLIGHT_MIN_TILE_RESOLUTION, TILE_WIDTH};
 use mappalachia_core::enums::{LockLevel, Signature};
-use mappalachia_core::model::Coord;
+use mappalachia_core::model::{Coord, Space};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::color::{parse_color, Rgba};
@@ -434,6 +435,51 @@ impl Default for MapSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Spotlight sizing (`Space.cs:71-81`, `MapSettings.CapSpotlightSizeToSpace`)
+// ---------------------------------------------------------------------------
+
+/// Mirrors C# `Space.GetMaxSpotlightBenefit` (`Space.cs:71-81`): the
+/// maximum spotlight size the space could utilise before the view gets
+/// smaller than the non-spotlight perspective.
+pub fn max_spotlight_benefit(space: &Space) -> f64 {
+    space.max_range / f64::from(TILE_WIDTH)
+}
+
+/// Mirrors C# `Space.IsSuitableForSpotlight`: the space is large enough
+/// to meet the minimum threshold to suitably benefit from spotlight.
+pub fn is_suitable_for_spotlight(space: &Space) -> bool {
+    max_spotlight_benefit(space) >= SPOTLIGHT_MIN_TILE_RESOLUTION
+}
+
+/// Upper end of the GUI size slider for `space`:
+/// `min(max_benefit, 16)` truncated like the C# `(int)` cast in
+/// `CapSpotlightSizeToSpace`, floored at 1 so the slider always has a
+/// valid range.
+pub fn spotlight_size_cap(space: &Space) -> f64 {
+    let max = max_spotlight_benefit(space).min(f64::from(SPOTLIGHT_MAX_SIZE)) as i32;
+    f64::from(max.max(1))
+}
+
+/// Clamp a spotlight size to `1..=cap` for `space` (same rule as
+/// [`MapSettings::cap_spotlight_size_to_space`], for GUI sliders and
+/// tests).
+pub fn clamp_spotlight_size(size: f64, space: &Space) -> f64 {
+    size.clamp(1.0, spotlight_size_cap(space))
+}
+
+impl MapSettings {
+    /// Mirrors C# `MapSettings.CapSpotlightSizeToSpace`: clamp
+    /// `spotlight_size` to `1..=min(max_benefit, 16)` (a sub-1 benefit
+    /// pins to 1, like the C# `maxSizeThisSpace <= 0` branch). Call on
+    /// space change. The location field is a plain assignment with no
+    /// side effects — tile-cache ownership lives in [`crate::assets`],
+    /// not settings (cf. the C# `SpotlightLocation` setter flush).
+    pub fn cap_spotlight_size_to_space(&mut self, space: &Space) {
+        self.spotlight_size = clamp_spotlight_size(self.spotlight_size, space);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SearchSettings (typed for the future egui frontend)
 // ---------------------------------------------------------------------------
 
@@ -659,5 +705,98 @@ mod tests {
         assert_eq!(map.background_image, BackgroundImageType::Render);
         let plot = plot_from_value(&json!({"Mode": "Standard"})).unwrap();
         assert_eq!(plot.mode, PlotMode::Standard);
+    }
+
+    fn appraisal_space() -> Space {
+        // Appalachia (DB row 2480661): center (-500, 135), range 582550.
+        Space::new(
+            2480661,
+            "APPALACHIA",
+            "Appalachia",
+            true,
+            true,
+            -500.0,
+            135.0,
+            582550.0,
+            0.0,
+        )
+    }
+
+    fn tiny_space() -> Space {
+        Space::new(
+            1,
+            "TINYCELL",
+            "Tiny cell",
+            false,
+            false,
+            0.0,
+            0.0,
+            1000.0,
+            0.0,
+        )
+    }
+
+    #[test]
+    fn spotlight_defaults_match_csharp() {
+        let map = MapSettings::default();
+        assert!(!map.spotlight_enabled);
+        assert_eq!(map.spotlight_size, 2.0);
+        assert_eq!(map.spotlight_location, Coord::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn max_spotlight_benefit_is_range_over_tile_width() {
+        // 582550 / 8192 ≈ 71.11 (cf. `Space.GetMaxSpotlightBenefit`).
+        let benefit = max_spotlight_benefit(&appraisal_space());
+        assert!(
+            (benefit - 582550.0 / 8192.0).abs() < 1e-9,
+            "benefit = {benefit}"
+        );
+    }
+
+    #[test]
+    fn suitability_needs_benefit_two_or_more() {
+        assert!(is_suitable_for_spotlight(&appraisal_space()));
+        assert!(!is_suitable_for_spotlight(&tiny_space()));
+        // Boundary: exactly 2 tiles (2 * 8192) is suitable, one unit less
+        // is not (cf. `Common.SpotlightMinTileResolution`).
+        let edge = Space::new(2, "EDGE", "Edge", false, false, 0.0, 0.0, 16384.0, 0.0);
+        assert!(is_suitable_for_spotlight(&edge));
+        let under = Space::new(3, "UNDER", "Under", false, false, 0.0, 0.0, 16383.0, 0.0);
+        assert!(!is_suitable_for_spotlight(&under));
+    }
+
+    #[test]
+    fn spotlight_cap_is_truncated_min_of_benefit_and_16() {
+        assert_eq!(spotlight_size_cap(&appraisal_space()), 16.0);
+        // 20000 / 8192 ≈ 2.44 -> truncates to 2 like the C# `(int)` cast.
+        let mid = Space::new(4, "MID", "Mid", false, false, 0.0, 0.0, 20000.0, 0.0);
+        assert_eq!(spotlight_size_cap(&mid), 2.0);
+        // Benefit < 1 still yields a usable slider floor of 1.
+        assert_eq!(spotlight_size_cap(&tiny_space()), 1.0);
+    }
+
+    #[test]
+    fn spotlight_size_clamps_to_one_through_cap() {
+        let big = appraisal_space();
+        assert_eq!(clamp_spotlight_size(99.0, &big), 16.0);
+        assert_eq!(clamp_spotlight_size(0.5, &big), 1.0);
+        assert_eq!(clamp_spotlight_size(2.0, &big), 2.0);
+        // A sub-1 benefit pins everything to 1 (C# `maxSizeThisSpace <= 0`
+        // branch).
+        assert_eq!(clamp_spotlight_size(16.0, &tiny_space()), 1.0);
+    }
+
+    #[test]
+    fn cap_spotlight_size_to_space_mirrors_csharp() {
+        let big = appraisal_space();
+        let mut map = MapSettings {
+            spotlight_size: 99.0,
+            ..MapSettings::default()
+        };
+        map.cap_spotlight_size_to_space(&big);
+        assert_eq!(map.spotlight_size, 16.0);
+        map.cap_spotlight_size_to_space(&tiny_space());
+        assert_eq!(map.spotlight_size, 1.0);
     }
 }

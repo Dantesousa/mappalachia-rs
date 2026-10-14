@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use mappalachia_core::{
-    common::MAP_IMAGE_RESOLUTION,
+    common::{MAP_IMAGE_RESOLUTION, SPOTLIGHT_MAX_SIZE},
     db,
     enums::{LockLevel, Signature},
     instances,
-    model::{EntityKind, Space},
+    model::{Coord, EntityKind, Space},
     recipe::{load_recipe_file, MapSettingsStub, PlotSettingsStub, Recipe},
     search::{search, Grouped, SearchParams, SearchResult},
 };
@@ -15,9 +15,10 @@ use mappalachia_render::{
     draw::{draw, DrawInput, Plottable},
     icon::PlotIcon,
     settings::{
-        map_from_value, plot_from_value, BackgroundImageType, CompassStyle,
-        LegendHorizontalAlignment, LegendStyle, LegendVerticalAlignment, MapSettings, PlotMode,
-        PlotSettings, PlotStyleSettings,
+        clamp_spotlight_size, is_suitable_for_spotlight, map_from_value, plot_from_value,
+        spotlight_size_cap, BackgroundImageType, CompassStyle, LegendHorizontalAlignment,
+        LegendStyle, LegendVerticalAlignment, MapSettings, PlotMode, PlotSettings,
+        PlotStyleSettings,
     },
 };
 
@@ -133,6 +134,24 @@ pub struct App {
     pub show_markers: bool,
     /// `MapSettings.ShowInfestations` (C# default off).
     pub show_infestations: bool,
+    /// `MapSettings.SpotlightEnabled` (C# default off). Enabling with no
+    /// spotlight data installed keeps the flag but reports a status hint
+    /// (mirrors `Notify.SpotlightInstallationPrompt`); enabling with data
+    /// installed flips [`App::background`] to `Render`, restoring the
+    /// previous value on disable (see
+    /// [`App::set_spotlight_enabled`]).
+    pub spotlight_enabled: bool,
+    /// Background to restore when spotlight is disabled (C#
+    /// `backgroundImagePreSpotlight`). Not render-affecting itself, so it
+    /// stays out of the settings fingerprint.
+    background_pre_spotlight: BackgroundImageType,
+    /// `MapSettings.SpotlightSize` in tiles (C# default 2; clamped
+    /// `1..=cap` per space via [`App::set_spotlight_size`]).
+    pub spotlight_size: f64,
+    /// `MapSettings.SpotlightLocation` (default = space center; plain
+    /// assignment, never auto-flushes — tile-cache ownership lives in
+    /// `Assets`, cf. the C# `SpotlightLocation` setter flush).
+    pub spotlight_location: (f64, f64),
     /// Plot style (C# defaults: size 50, 8-color palette); display-only in
     /// v1, editable in a later task.
     pub plot_style: PlotStyleSettings,
@@ -266,6 +285,10 @@ impl App {
         };
         let space_idx = spaces.iter().position(|s| s.is_appalachia()).unwrap_or(0);
         let filename = recommended_stem("", spaces.get(space_idx));
+        let spotlight_location = spaces
+            .get(space_idx)
+            .map(|s| (s.center_x, s.center_y))
+            .unwrap_or((0.0, 0.0));
         Self {
             db_path,
             assets_root,
@@ -291,6 +314,10 @@ impl App {
             show_grid: false,
             show_markers: false,
             show_infestations: false,
+            spotlight_enabled: false,
+            background_pre_spotlight: BackgroundImageType::Menu,
+            spotlight_size: 2.0,
+            spotlight_location,
             plot_style: PlotStyleSettings::default(),
             plot_mode: PlotMode::Standard,
             preview: PreviewState::Idle,
@@ -328,6 +355,9 @@ impl App {
             map_marker_icons: self.show_markers,
             map_marker_labels: self.show_markers,
             show_infestations: self.show_infestations,
+            spotlight_enabled: self.spotlight_enabled,
+            spotlight_size: self.spotlight_size,
+            spotlight_location: Coord::new(self.spotlight_location.0, self.spotlight_location.1),
             ..MapSettings::default()
         };
         let plot = PlotSettings {
@@ -696,9 +726,108 @@ impl App {
             return;
         };
         let (idx, name) = (hit.space_idx, hit.display_name.clone());
-        self.space_idx = idx;
-        self.invalidate_preview();
+        self.set_space_idx(idx);
         self.status = format!("Switched to {name}.");
+    }
+
+    /// The current full-DB space, if any is loaded.
+    fn current_space(&self) -> Option<&Space> {
+        self.spaces.get(self.space_idx)
+    }
+
+    /// Mirrors C# `FileIO.IsSpotlightInstalled` for the configured asset
+    /// root: false when `assets_root` is unset. Pure state query (opens a
+    /// throwaway [`Assets`] handle, no caching) so the GUI install-state
+    /// line and the enable path share it.
+    pub fn is_spotlight_installed(&self) -> bool {
+        match &self.assets_root {
+            Some(root) => Assets::open(root).is_spotlight_installed(),
+            None => false,
+        }
+    }
+
+    /// Mirrors C# `Space.IsSuitableForSpotlight` for the current space
+    /// (false when no spaces are loaded).
+    pub fn is_spotlight_suitable(&self) -> bool {
+        self.current_space().is_some_and(is_suitable_for_spotlight)
+    }
+
+    /// Upper end of the GUI size slider for the current space (`16` when
+    /// no space is loaded).
+    pub fn spotlight_cap(&self) -> f64 {
+        self.current_space()
+            .map(spotlight_size_cap)
+            .unwrap_or(f64::from(SPOTLIGHT_MAX_SIZE))
+    }
+
+    /// Enable/disable spotlight (C# `MapSettings.SpotlightEnabled`
+    /// setter): enabling with no data installed keeps the flag but
+    /// reports a status hint (mirrors
+    /// `Notify.SpotlightInstallationPrompt`); enabling with data
+    /// installed flips the background to `Render`, and disabling
+    /// restores the background from before enabling. No-op when the flag
+    /// is unchanged. Invalidates the preview otherwise.
+    pub fn set_spotlight_enabled(&mut self, enabled: bool) {
+        if enabled == self.spotlight_enabled {
+            return;
+        }
+        let installed = self.is_spotlight_installed();
+        if enabled && !self.spotlight_enabled {
+            self.background_pre_spotlight = self.background;
+        }
+        if !enabled && self.spotlight_enabled {
+            self.background = self.background_pre_spotlight;
+        }
+        if enabled && !self.spotlight_enabled && installed {
+            self.background = BackgroundImageType::Render;
+        }
+        self.spotlight_enabled = enabled;
+        if enabled && !installed {
+            self.status =
+                "Spotlight is not installed! Unable to be used. Please install it and try again."
+                    .to_string();
+        }
+        self.invalidate_preview();
+    }
+
+    /// Clamp + store the spotlight size for the current space (`1..=cap`;
+    /// C# `SpotlightSize` + `CapSpotlightSizeToSpace`). Invalidates.
+    pub fn set_spotlight_size(&mut self, size: f64) {
+        match self.current_space().cloned() {
+            Some(space) => self.spotlight_size = clamp_spotlight_size(size, &space),
+            None => self.spotlight_size = size.clamp(1.0, f64::from(SPOTLIGHT_MAX_SIZE)),
+        }
+        self.invalidate_preview();
+    }
+
+    /// Clamp the stored size to the current space without invalidating
+    /// (the space-combo path invalidates via the settings fingerprint).
+    fn cap_spotlight_size(&mut self) {
+        if let Some(space) = self.current_space().cloned() {
+            self.spotlight_size = clamp_spotlight_size(self.spotlight_size, &space);
+        }
+    }
+
+    /// Switch the current space: bounds-checked, caps the spotlight size
+    /// to the new space (C# `CapSpotlightSizeToSpace on space change`),
+    /// and invalidates. Out-of-range indexes are a no-op.
+    pub fn set_space_idx(&mut self, idx: usize) {
+        if idx >= self.spaces.len() {
+            return;
+        }
+        self.space_idx = idx;
+        self.cap_spotlight_size();
+        self.invalidate_preview();
+    }
+
+    /// Reset the spotlight location to the current space center (C#
+    /// `SetSpotlightToMapCenter`). No-op without spaces. Invalidates.
+    pub fn reset_spotlight_to_center(&mut self) {
+        let Some(space) = self.current_space() else {
+            return;
+        };
+        self.spotlight_location = (space.center_x, space.center_y);
+        self.invalidate_preview();
     }
 
     /// Recommended filename stem for the current map (mirrors
@@ -853,6 +982,11 @@ impl App {
         // v1 has a single markers toggle driving both C# flags.
         self.show_markers = map.map_marker_icons || map.map_marker_labels;
         self.show_infestations = map.show_infestations;
+        self.spotlight_enabled = map.spotlight_enabled;
+        self.background_pre_spotlight = map.background_image;
+        self.spotlight_size = map.spotlight_size;
+        self.spotlight_location = (map.spotlight_location.x, map.spotlight_location.y);
+        self.cap_spotlight_size();
         // Standard-locked until the modes plan: the v1 combo cannot
         // represent the other modes, so clamp (a recipe saved elsewhere may
         // store Topographic/Heatmap/Cluster, which `draw` would reject).
@@ -924,6 +1058,9 @@ struct SettingsFingerprint {
     show_grid: bool,
     show_markers: bool,
     show_infestations: bool,
+    spotlight_enabled: bool,
+    spotlight_size: f64,
+    spotlight_location: (f64, f64),
     plot_mode: PlotMode,
     plot_style: PlotStyleSettings,
 }
@@ -1014,6 +1151,9 @@ impl App {
             show_grid: self.show_grid,
             show_markers: self.show_markers,
             show_infestations: self.show_infestations,
+            spotlight_enabled: self.spotlight_enabled,
+            spotlight_size: self.spotlight_size,
+            spotlight_location: self.spotlight_location,
             plot_mode: self.plot_mode,
             plot_style: self.plot_style.clone(),
         }
@@ -1371,6 +1511,7 @@ impl eframe::App for App {
         // Snapshot before the panels: any settings edit below stales the
         // preview (compared again after the settings panel).
         let settings_before = self.settings_fingerprint();
+        let space_before = self.space_idx;
         egui::SidePanel::left("search_panel")
             .resizable(true)
             .show(ctx, |ui| {
@@ -1566,6 +1707,52 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.show_markers, "Map markers");
                 ui.checkbox(&mut self.show_infestations, "Infestations");
                 ui.separator();
+                ui.heading("Spotlight");
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Installed: {}",
+                        if self.is_spotlight_installed() {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    ));
+                    if ui.button("Download").clicked() {
+                        // INERT placeholder: Task 5 wires the downloader.
+                        self.status = "Spotlight download is wired in Task 5.".to_string();
+                    }
+                });
+                let mut enabled = self.spotlight_enabled;
+                if ui.checkbox(&mut enabled, "Spotlight").changed() {
+                    self.set_spotlight_enabled(enabled);
+                }
+                let suitable = self.is_spotlight_suitable();
+                let cap = self.spotlight_cap();
+                if suitable {
+                    let mut size = self.spotlight_size;
+                    if ui
+                        .add(egui::Slider::new(&mut size, 1.0..=cap).text("Size"))
+                        .changed()
+                    {
+                        self.set_spotlight_size(size);
+                    }
+                } else {
+                    ui.add_enabled(
+                        false,
+                        egui::Slider::new(&mut self.spotlight_size, 1.0..=cap).text("Size"),
+                    );
+                    ui.weak("Space too small for spotlight.");
+                }
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Location: ({:.0}, {:.0})",
+                        self.spotlight_location.0, self.spotlight_location.1
+                    ));
+                    if ui.button("Reset to map center").clicked() {
+                        self.reset_spotlight_to_center();
+                    }
+                });
+                ui.separator();
                 ui.heading("Plot");
                 // Standard-locked until the modes plan: the other modes are
                 // visible but disabled, with no code paths behind them.
@@ -1588,6 +1775,12 @@ impl eframe::App for App {
 
         // Any settings edit above stales the preview. The widgets write the
         // fields directly (no setters to hook), so diff the fingerprint.
+        // A space switch also caps the spotlight size to the new space
+        // (C# `CapSpotlightSizeToSpace`); the fingerprint diff below picks
+        // up the invalidation.
+        if self.space_idx != space_before {
+            self.cap_spotlight_size();
+        }
         if self.settings_fingerprint() != settings_before {
             self.invalidate_preview();
         }
@@ -2457,6 +2650,172 @@ mod tests {
         let app = settings_app();
         assert!(app.auto_render, "Auto render defaults ON");
         assert!(!app.dirty, "fresh state is clean");
+    }
+
+    /// Task 4 RED: spotlight state mirroring `Settings/MapSettings.cs`.
+    #[test]
+    fn spotlight_defaults_follow_csharp() {
+        let app = settings_app();
+        assert!(!app.spotlight_enabled);
+        assert_eq!(app.spotlight_size, 2.0);
+        let space = &app.spaces[app.space_idx];
+        assert_eq!(
+            app.spotlight_location,
+            (space.center_x, space.center_y),
+            "default location is the space center"
+        );
+        assert!(
+            !app.is_spotlight_installed(),
+            "no asset root: not installed"
+        );
+    }
+
+    #[test]
+    fn default_spotlight_location_is_space_center() {
+        let space = Space::new(
+            7,
+            "SOMEWHERE",
+            "Somewhere",
+            true,
+            true,
+            123.0,
+            -456.0,
+            100000.0,
+            0.0,
+        );
+        let app = App::from_parts(None, None, vec![space]);
+        assert_eq!(app.spotlight_location, (123.0, -456.0));
+    }
+
+    /// Scratch asset tree with one non-empty spotlight tile, so
+    /// `is_spotlight_installed` passes without the real game data.
+    fn spotlight_tmp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mappalachia-spotlight-{tag}-{}",
+            std::process::id()
+        ));
+        let sub = dir.join("img/spotlight/APPALACHIA");
+        std::fs::create_dir_all(&sub).expect("tmp spotlight tree");
+        std::fs::write(sub.join("0.0.jpg"), [1u8; 16]).expect("tmp tile");
+        dir
+    }
+
+    fn remove_tmp_root(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spotlight_install_probe() {
+        assert!(!settings_app().is_spotlight_installed());
+        let dir = spotlight_tmp_root("probe");
+        let mut app = settings_app();
+        app.assets_root = Some(dir.to_string_lossy().into_owned());
+        assert!(app.is_spotlight_installed());
+        let empty = std::env::temp_dir().join(format!(
+            "mappalachia-spotlight-empty-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&empty).expect("tmp empty tree");
+        app.assets_root = Some(empty.to_string_lossy().into_owned());
+        assert!(!app.is_spotlight_installed());
+        remove_tmp_root(&dir);
+        remove_tmp_root(&empty);
+    }
+
+    #[test]
+    fn enable_without_data_hints_and_keeps_background() {
+        // Mirrors `Notify.SpotlightInstallationPrompt`: the flag is still
+        // set, but the background is left alone and `status` says why.
+        let mut app = settings_app();
+        app.set_spotlight_enabled(true);
+        assert!(app.spotlight_enabled);
+        assert_eq!(app.background, BackgroundImageType::Menu);
+        assert!(
+            app.status.contains("not installed"),
+            "status must hint, got: {}",
+            app.status
+        );
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn enable_with_data_flips_to_render_disable_restores() {
+        let dir = spotlight_tmp_root("flip");
+        let mut app = settings_app();
+        app.assets_root = Some(dir.to_string_lossy().into_owned());
+        app.background = BackgroundImageType::Military;
+        app.set_spotlight_enabled(true);
+        assert!(app.spotlight_enabled);
+        assert_eq!(app.background, BackgroundImageType::Render);
+        app.set_spotlight_enabled(false);
+        assert!(!app.spotlight_enabled);
+        assert_eq!(
+            app.background,
+            BackgroundImageType::Military,
+            "disable restores the pre-spotlight background"
+        );
+        remove_tmp_root(&dir);
+    }
+
+    #[test]
+    fn reset_spotlight_goes_to_map_center() {
+        let mut app = settings_app();
+        app.spotlight_location = (999.0, 999.0);
+        app.dirty = false;
+        app.reset_spotlight_to_center();
+        let space = &app.spaces[app.space_idx];
+        assert_eq!(app.spotlight_location, (space.center_x, space.center_y));
+        assert!(app.dirty);
+        // No spaces: no-op, never panics.
+        let mut empty = App::from_parts(None, None, Vec::new());
+        empty.reset_spotlight_to_center();
+        assert_eq!(empty.spotlight_location, (0.0, 0.0));
+    }
+
+    #[test]
+    fn spotlight_size_clamps_to_space_cap() {
+        // settings_app space: range 100000 -> benefit ~12.2 -> cap 12.
+        let mut app = settings_app();
+        assert_eq!(app.spotlight_cap(), 12.0);
+        app.set_spotlight_size(99.0);
+        assert_eq!(app.spotlight_size, 12.0);
+        app.set_spotlight_size(0.5);
+        assert_eq!(app.spotlight_size, 1.0);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn set_space_idx_caps_size_and_ignores_out_of_range() {
+        let big = Space::new(1, "BIG", "Big", true, true, 0.0, 0.0, 100000.0, 0.0);
+        let tiny = Space::new(2, "TINY", "Tiny", false, false, 0.0, 0.0, 1000.0, 0.0);
+        let mut app = App::from_parts(None, None, vec![big, tiny]);
+        app.set_spotlight_size(12.0);
+        assert_eq!(app.spotlight_size, 12.0);
+        app.set_space_idx(1);
+        assert_eq!(app.space_idx, 1);
+        assert_eq!(app.spotlight_size, 1.0, "switching space caps the size");
+        app.set_space_idx(99);
+        assert_eq!(app.space_idx, 1, "out-of-range switch is a no-op");
+        assert_eq!(app.spotlight_size, 1.0);
+    }
+
+    #[test]
+    fn spotlight_state_feeds_fingerprint_and_draw_settings() {
+        let mut app = settings_app();
+        let before = app.settings_fingerprint();
+        app.set_spotlight_size(5.0);
+        assert_ne!(app.settings_fingerprint(), before);
+        app.reset_spotlight_to_center();
+        app.spotlight_location = (1.0, 2.0);
+        assert_ne!(app.settings_fingerprint(), before);
+        app.spotlight_enabled = true;
+        let settings = app.draw_settings().expect("space loaded");
+        assert!(settings.map.spotlight_enabled);
+        assert_eq!(settings.map.spotlight_size, 5.0);
+        assert_eq!(
+            settings.map.spotlight_location,
+            mappalachia_core::model::Coord::new(1.0, 2.0)
+        );
     }
 
     #[test]

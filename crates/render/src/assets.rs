@@ -284,7 +284,8 @@ impl Assets {
                     .path()
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"));
-                if is_jpg && file.metadata().is_ok_and(|m| m.len() > 0) {
+                let is_file = file.file_type().is_ok_and(|t| t.is_file());
+                if is_jpg && is_file && file.metadata().is_ok_and(|m| m.len() > 0) {
                     return true;
                 }
             }
