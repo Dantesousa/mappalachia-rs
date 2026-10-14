@@ -14,10 +14,14 @@
 //!    legend leave non-empty pixels in the legend strip.
 //! 4. `spotlight_size2_at_map_center_matches_tile` — Appalachia Render
 //!    background with spotlight enabled (size 2, location at the space
-//!    center) renders 4096x4096; an inset patch of installed tile (-1,-1)
-//!    matches its source-box mean and the tile-center pixel matches its
-//!    ~71x71 source-footprint mean (tile layer paints tiles at their world
-//!    rects), and the full-image dHash is pinned (drift fails).
+//!    center) renders 4096x4096 through the zoomed spotlight projection;
+//!    an inset patch of installed tile (-1,-1) matches its source-box mean
+//!    and the tile-center pixel matches its ~2x2 source-footprint mean
+//!    (tile layer paints tiles at their world rects), and the full-image
+//!    dHash is pinned (drift fails).
+//! 5. `spotlight_size2_grid_on_paints_grid` — same spotlight render with
+//!    the coordinate grid on: 4096x4096, dark-gray grid strokes present,
+//!    dHash pinned.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,7 +34,7 @@ use mappalachia_render::assets::{Assets, BackgroundKind};
 use mappalachia_render::canvas::straight_pixel;
 use mappalachia_render::draw::{draw, prepare_items, DrawInput};
 use mappalachia_render::settings::{BackgroundImageType, MapSettings, PlotSettings};
-use mappalachia_render::transform::{image_rect_of_world, world_to_image, View};
+use mappalachia_render::transform::{image_rect_of_world, spot_view, world_to_image};
 
 fn asset_root() -> Option<String> {
     let root = std::env::var("MAPPALACHIA_ASSETS").ok()?;
@@ -388,7 +392,7 @@ fn legend_smoke_right_side_nonempty() {
 
 /// dHash of the spotlight render below, recorded on the first green run;
 /// any tile-layer drift fails this test.
-const EXPECTED_SPOTLIGHT_DHASH: u64 = 0x88e84c464e4a0a13;
+const EXPECTED_SPOTLIGHT_DHASH: u64 = 0x752c5a5272c144cd;
 
 #[test]
 fn spotlight_size2_at_map_center_matches_tile() {
@@ -420,8 +424,8 @@ fn spotlight_size2_at_map_center_matches_tile() {
     // Dev-data note: the 2.0.5.2 tile set pre-renders only playable space,
     // and no tile covers the space center itself (that would be tile
     // (-1, 0)). The tile-content assertion therefore targets the nearest
-    // installed tile, (-1, -1), whose center maps near the canvas center
-    // through the standard full-canvas view.
+    // installed tile, (-1, -1), whose center maps left-of-center through
+    // the zoomed spotlight projection.
     let tile = SpotlightTile::new(
         space.clone(),
         SpotlightTile::snap_to_tile_center(-4096.0),
@@ -433,15 +437,15 @@ fn spotlight_size2_at_map_center_matches_tile() {
         .expect("spotlight tile (-1,-1) installed under img/spotlight/APPALACHIA");
     assert_eq!(src.dimensions(), (4096, 4096));
 
-    let view = View::for_space(&space);
-    // The tile is minified ~71:1 (8192 world units over ~58 canvas px), so
-    // no canvas pixel reproduces one source pixel: each canvas pixel
-    // integrates a ~71x71 source footprint (tiny-skia Bicubic). Both
+    let spot = spot_view((space.center_x, space.center_y), 2.0);
+    // The tile is minified 2:1 through the spotlight projection (8192 world
+    // units over 2048 canvas px at factor 4.0), so each canvas pixel
+    // integrates a ~2x2 source footprint (tiny-skia Bicubic). Both
     // assertions below therefore compare against source-box MEANS located
     // through the same transform math (no hardcoded pixels).
     let (tx, ty, tw, th) = tile.rectangle();
     let (ix, iy, iw, ih) = image_rect_of_world(
-        &view,
+        &spot,
         f64::from(tx),
         f64::from(ty),
         f64::from(tw),
@@ -481,7 +485,7 @@ fn spotlight_size2_at_map_center_matches_tile() {
 
     // Single canvas pixel at the tile center (floor: the true center maps
     // to a fractional pixel, so floor keeps the footprint straddling it).
-    let (fx, fy) = world_to_image(&view, -4096.0, -4096.0);
+    let (fx, fy) = world_to_image(&spot, -4096.0, -4096.0);
     let (px, py) = (fx.floor() as u32, fy.floor() as u32);
     assert!(px < 4096 && py < 4096, "tile center maps on canvas");
     eprintln!("tile center -> canvas ({fx}, {fy}), probing ({px}, {py})");
@@ -493,9 +497,16 @@ fn spotlight_size2_at_map_center_matches_tile() {
     );
 
     // Inset patch (pure tile interior, clear of edge blending) vs its
-    // matching source box.
-    let (x0, x1) = ((ix + 2.0) as u32, (ix + iw - 2.0) as u32);
-    let (y0, y1) = ((iy + 2.0) as u32, (iy + ih - 2.0) as u32);
+    // matching source box. The zoomed tile rect can extend past the canvas
+    // edge, so clamp the probe box to the canvas.
+    let (x0, x1) = (
+        (ix + 2.0).max(2.0) as u32,
+        (ix + iw - 2.0).min(4094.0) as u32,
+    );
+    let (y0, y1) = (
+        (iy + 2.0).max(2.0) as u32,
+        (iy + ih - 2.0).min(4094.0) as u32,
+    );
     let (mut pr, mut pg, mut pb, mut pn) = (0u64, 0u64, 0u64, 0u64);
     let mut y = y0;
     while y <= y1 {
@@ -528,7 +539,7 @@ fn spotlight_size2_at_map_center_matches_tile() {
         single_mean[1] as u8,
         single_mean[2] as u8,
     ]) {
-        // Bicubic minification vs box-mean: measured spread (13, 11, 3).
+        // Bicubic minification vs box-mean: measured spread (7, 9, 8).
         assert!(
             (i16::from(got_c) - i16::from(want_c)).abs() <= 20,
             "tile pixel drifted: got ({}, {}, {}) want footprint-mean ({}, {}, {})",
@@ -557,5 +568,62 @@ fn spotlight_size2_at_map_center_matches_tile() {
     assert_eq!(
         hash, EXPECTED_SPOTLIGHT_DHASH,
         "render drift: spotlight dHash changed (first green run fills EXPECTED_SPOTLIGHT_DHASH)"
+    );
+}
+
+/// dHash of the spotlight+grid render below, recorded on the first green
+/// run; any grid-branch drift fails this test.
+const EXPECTED_SPOTLIGHT_GRID_DHASH: u64 = 0x75285a52f2c144cc;
+
+#[test]
+fn spotlight_size2_grid_on_paints_grid() {
+    let Some((assets_root, conn)) = requires() else {
+        return;
+    };
+    let space = appalachia(&conn);
+    let mut assets = Assets::open(&assets_root);
+    let map = MapSettings {
+        brightness: 1.0,
+        background_image: BackgroundImageType::Render,
+        spotlight_enabled: true,
+        spotlight_size: 2.0,
+        spotlight_location: Coord::new(space.center_x, space.center_y),
+        show_coordinate_grid: true,
+        ..Default::default()
+    };
+    let plot = PlotSettings::default();
+    let input = DrawInput {
+        conn: &conn,
+        assets: &mut assets,
+        space: space.clone(),
+        map,
+        plot,
+        items: Vec::new(),
+    };
+    let img = draw(input).unwrap();
+    assert_eq!((img.width(), img.height()), (4096, 4096));
+
+    // Grid strokes are C# `Color.DarkGray` (#A9A9A9) painted opaque over the
+    // map, so their bytes are exact in the (premultiplied) canvas.
+    let mut grid_px = 0u64;
+    for px in img.data().as_chunks::<4>().0 {
+        if *px == [169, 169, 169, 255] {
+            grid_px += 1;
+        }
+    }
+    eprintln!("spotlight grid-on exact-dark-gray pixels = {grid_px}");
+    assert!(
+        grid_px > 10_000,
+        "grid strokes must be painted through the spotlight projection, got {grid_px}"
+    );
+
+    let raw = image::RgbaImage::from_raw(4096, 4096, img.data().to_vec())
+        .expect("canvas bytes form an RGBA image");
+    let hash = dhash(&raw);
+    eprintln!("spotlight grid-on dHash = {hash:#018x}");
+    drop(raw);
+    assert_eq!(
+        hash, EXPECTED_SPOTLIGHT_GRID_DHASH,
+        "render drift: spotlight grid dHash changed (first green run fills EXPECTED_SPOTLIGHT_GRID_DHASH)"
     );
 }

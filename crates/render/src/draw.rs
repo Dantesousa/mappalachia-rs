@@ -14,10 +14,12 @@
 //! # Porting notes
 //! - Standard mode only: [`draw`] returns
 //!   [`DrawError::UnsupportedPlotMode`] for any other [`PlotMode`].
-//! - Spotlight tiles ([`draw_spotlight_tiles`], `Map.cs:344-401`) draw right
-//!   after the background when `spotlight_enabled` with a `Render`
-//!   background; the pipeline always renders at full-canvas scale
-//!   (`transform::View::for_space`).
+//! - Spotlight (`spotlight_enabled`): every world mapping uses the
+//!   spotlight projection (`transform::SpotView`: the spotlight location as
+//!   center, `SpotlightSize * TileWidth / 4096` factor, per `Map.cs:1241-1254`),
+//!   so the whole map zooms; the background is drawn at `background_rect`
+//!   (`Map.cs:1310-1318`) and tiles are enumerated through the zoomed
+//!   projection (`Map.cs:344-401`).
 //! - Door and infestation SVGs are scale-1 in C# (`Map.cs:804` default
 //!   `DoorIconScale = 1`; `GetInfestationMarker` passes no scale) while
 //!   [`Assets::svg_marker`](crate::assets::Assets::svg_marker) bakes 1.5x,
@@ -57,7 +59,8 @@ use crate::settings::{
 };
 use crate::text::{Align, Font};
 use crate::transform::{
-    image_rect_of_world, world_len_to_image, world_rect_of_image, world_to_image, View,
+    background_rect, image_rect_of_world, spot_view, world_len_to_image, world_rect_of_image,
+    world_to_image, Projection, SpotView, View,
 };
 
 const CANVAS: f32 = MAP_IMAGE_RESOLUTION as f32;
@@ -322,7 +325,7 @@ fn draw_spotlight_tiles(
     img: &mut tiny_skia::Pixmap,
     assets: &mut Assets,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
 ) {
     let (left, top, width, height) = world_rect_of_image(view, 0.0, 0.0, CANVAS, CANVAS);
     for tile in SpotlightTile::tiles_in_rect(left, top, width, height, space) {
@@ -364,6 +367,39 @@ fn settings_background_kind(kind: BackgroundImageType) -> BackgroundKind {
 // Pipeline
 // ---------------------------------------------------------------------------
 
+/// Active world→image projection for one render: full-space, or the zoomed
+/// spotlight view. Mirrors the C# `GetWorldCenter` / `GetWorldToImageFactor`
+/// spotlight branches (`Map.cs:1241-1254`): when spotlight is enabled the
+/// center is the spotlight location and the factor is
+/// `SpotlightSize * TileWidth / 4096`, while every formula stays identical.
+enum ActiveView {
+    Space(View),
+    Spot(SpotView),
+}
+
+impl Projection for ActiveView {
+    fn center_x(&self) -> f64 {
+        match self {
+            Self::Space(view) => view.center_x(),
+            Self::Spot(view) => view.center_x(),
+        }
+    }
+
+    fn center_y(&self) -> f64 {
+        match self {
+            Self::Space(view) => view.center_y(),
+            Self::Spot(view) => view.center_y(),
+        }
+    }
+
+    fn factor(&self) -> f64 {
+        match self {
+            Self::Space(view) => view.factor(),
+            Self::Spot(view) => view.factor(),
+        }
+    }
+}
+
 /// Port of `Map.Draw` (`Map.cs:122-209`) for Standard mode
 /// (`DrawStandardPlots(topographic = false)`).
 pub fn draw(input: DrawInput<'_>) -> Result<tiny_skia::Pixmap, DrawError> {
@@ -379,19 +415,37 @@ pub fn draw(input: DrawInput<'_>) -> Result<tiny_skia::Pixmap, DrawError> {
         return Err(DrawError::UnsupportedPlotMode(format!("{:?}", plot.mode)));
     }
 
-    let view = View::for_space(&space);
+    // `GetWorldCenter` / `GetWorldToImageFactor` (`Map.cs:1241-1254`):
+    // spotlight swaps in the spotlight location and `size * TileWidth`
+    // range, so the entire map (background, tiles, grid, plots, markers)
+    // zooms through one projection.
+    let view = if map.spotlight_enabled {
+        ActiveView::Spot(spot_view(
+            (map.spotlight_location.x, map.spotlight_location.y),
+            map.spotlight_size,
+        ))
+    } else {
+        ActiveView::Space(View::for_space(&space))
+    };
+    let spotlight = match &view {
+        ActiveView::Spot(spot) => Some(spot),
+        ActiveView::Space(_) => None,
+    };
     let font = Font::from_bytes(&assets.font_bytes());
 
     // Empty 4096 canvas (transparent; mirrors `new Bitmap(EmptyMapImage)`).
     let mut img = tiny_skia::Pixmap::new(MAP_IMAGE_RESOLUTION as u32, MAP_IMAGE_RESOLUTION as u32)
         .expect("valid canvas size");
 
-    // Background stretched to the full rect (missing -> leave empty).
+    // Background at the scaled rect (`GetScaledMapBackgroundRect`,
+    // `Map.cs:1310-1318`): full canvas normally, the space rect mapped
+    // through the spotlight projection when enabled (missing -> empty).
     if map.background_image != BackgroundImageType::None {
         let kind = settings_background_kind(map.background_image);
         let bg = assets.background(&space, &kind).map(pixmap_from_image);
         if let Some(bg) = bg {
-            blit(&mut img, &bg, 0.0, 0.0, CANVAS, CANVAS);
+            let (bx, by, bw, bh) = background_rect(&space, spotlight);
+            blit(&mut img, &bg, bx, by, bw, bh);
         }
     }
 
@@ -420,11 +474,12 @@ pub fn draw(input: DrawInput<'_>) -> Result<tiny_skia::Pixmap, DrawError> {
     // Brightness/grayscale over the whole canvas.
     adjust_canvas(&mut img, map.brightness, map.grayscale_background);
 
-    // Water mask overlay.
+    // Water mask overlay (same scaled rect as the background, `Map.cs:144`).
     if map.highlight_water && space.is_worldspace {
         let mask = assets.water_mask(&space).map(pixmap_from_image);
         if let Some(mask) = mask {
-            blit(&mut img, &mask, 0.0, 0.0, CANVAS, CANVAS);
+            let (bx, by, bw, bh) = background_rect(&space, spotlight);
+            blit(&mut img, &mask, bx, by, bw, bh);
         }
     }
 
@@ -514,7 +569,7 @@ fn draw_coordinate_grid(
     font: &Font,
     map: &MapSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
 ) {
     let target_intervals = match map.coordinate_grid_precision {
         CoordinateGridPrecision::Fine => 40.0,
@@ -596,7 +651,7 @@ fn draw_infestations(
     img: &mut tiny_skia::Pixmap,
     assets: &mut Assets,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
 ) -> Result<(), DrawError> {
     let radius = db::infestation_radius(conn)? as f32;
     for location in instances::infestation_locations(conn, space)? {
@@ -626,7 +681,7 @@ fn draw_map_markers(
     assets: &mut Assets,
     map: &MapSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
 ) -> Result<(), DrawError> {
     let px = (map.font_settings.size_map_marker_label) as f32;
     for marker in db::map_markers_for_space(conn, space.form_id())? {
@@ -669,7 +724,7 @@ fn draw_standard_plots(
     map: &MapSettings,
     plot: &PlotSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
     items: &[Plottable],
 ) -> Result<(), DrawError> {
     for item in items {
@@ -720,7 +775,7 @@ fn draw_region(
     item: &Plottable,
     map: &MapSettings,
     plot: &PlotSettings,
-    view: &View,
+    view: &impl Projection,
     conn: &Connection,
 ) -> Result<(), DrawError> {
     let item_space = item.result.space().clone();
@@ -767,7 +822,7 @@ fn draw_location(
     instance: &mappalachia_core::model::Instance,
     item: &Plottable,
     plot: &PlotSettings,
-    view: &View,
+    view: &impl Projection,
     conn: &Connection,
 ) -> Result<(), DrawError> {
     let item_space = item.result.space().clone();
@@ -827,7 +882,7 @@ fn draw_primitive_shape(
     instance: &mappalachia_core::model::Instance,
     color: Rgba,
     mode: VolumeDrawMode,
-    view: &View,
+    view: &impl Projection,
 ) {
     let shape = instance.primitive_shape.expect("shape branch has a shape");
     let (cx, cy) = world_to_image(view, instance.coord.x, instance.coord.y);
@@ -869,7 +924,7 @@ fn draw_instance_form_ids(
     font: &Font,
     map: &MapSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
     items: &[Plottable],
 ) -> Result<(), DrawError> {
     let _ = space;
@@ -905,7 +960,7 @@ fn draw_connecting_space_plots(
     map: &MapSettings,
     plot: &PlotSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
     items: &[Plottable],
 ) -> Result<(), DrawError> {
     let selected_teleporters = instances::teleporters(conn, space)?;
