@@ -1,3 +1,7 @@
+// GUI-only binary: hide the CMD console window on Windows. The CLI crate
+// (`mappalachia-cli`) is unaffected and keeps its console.
+#![windows_subsystem = "windows"]
+
 mod app;
 
 fn main() -> eframe::Result<()> {
