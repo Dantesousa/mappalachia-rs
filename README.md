@@ -44,6 +44,23 @@ cargo run -p mappalachia-cli -- path/to/recipe.json
 cargo run -p mappalachia-egui
 ```
 
+## Spotlight (opt-in hires tiles)
+
+Spotlight swaps the drawn map background for true top-down game tiles —
+off by default. The tile set is a ~3 GB download (two 7z volumes, game
+version 2.0.5.2) installed into `img/spotlight/` next to the binary.
+
+In the GUI, open the map settings panel → **Spotlight**: press
+**Download** (progress bars show download → extract → verify; **Cancel**
+aborts), then tick the **Spotlight** checkbox. Enabling flips the
+background to Render (restored on disable); **Size** (1–16 tiles, capped
+per space) and **Location** with **Reset to map center** tune the view.
+Without installed tiles the toggle stays off with a status hint.
+
+From source / dev: instead of downloading, symlink a tile tree into the
+asset root — `ln -s /path/to/spotlight <assets>/img/spotlight` — and point
+`MAPPALACHIA_ASSETS` at that root.
+
 ## Releases
 
 Tagged pushes (`v*`) build Windows (exe) and Linux (AppImage) binaries via GitHub Actions.

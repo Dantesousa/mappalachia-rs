@@ -3,6 +3,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod spotlight_dl;
 
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {

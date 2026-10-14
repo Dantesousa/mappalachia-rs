@@ -14,9 +14,12 @@
 //! # Porting notes
 //! - Standard mode only: [`draw`] returns
 //!   [`DrawError::UnsupportedPlotMode`] for any other [`PlotMode`].
-//! - Spotlight tiles are skipped (see [`draw_spotlight_tiles_stub`]): the
-//!   high-res tile image set is not in scope, and the pipeline always renders
-//!   at full-canvas scale (`transform::View::for_space`).
+//! - Spotlight (`spotlight_enabled`): every world mapping uses the
+//!   spotlight projection (`transform::SpotView`: the spotlight location as
+//!   center, `SpotlightSize * TileWidth / 4096` factor, per `Map.cs:1241-1254`),
+//!   so the whole map zooms; the background is drawn at `background_rect`
+//!   (`Map.cs:1310-1318`) and tiles are enumerated through the zoomed
+//!   projection (`Map.cs:344-401`).
 //! - Door and infestation SVGs are scale-1 in C# (`Map.cs:804` default
 //!   `DoorIconScale = 1`; `GetInfestationMarker` passes no scale) while
 //!   [`Assets::svg_marker`](crate::assets::Assets::svg_marker) bakes 1.5x,
@@ -35,10 +38,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use mappalachia_core::common::{to_hex_u32, CELL_SIZE, MAP_IMAGE_RESOLUTION};
+use mappalachia_core::common::{to_hex_u32, CELL_SIZE, MAP_IMAGE_RESOLUTION, SPOTLIGHT_TILE_SIZE};
 use mappalachia_core::db;
 use mappalachia_core::instances;
-use mappalachia_core::model::{Coord, EntityKind, Space};
+use mappalachia_core::model::{Coord, EntityKind, Space, SpotlightTile};
 use mappalachia_core::search::SearchResult;
 use rusqlite::Connection;
 
@@ -55,7 +58,10 @@ use crate::settings::{
     LegendStyle, LegendVerticalAlignment, MapSettings, PlotMode, PlotSettings, VolumeDrawMode,
 };
 use crate::text::{Align, Font};
-use crate::transform::{image_rect_of_world, world_len_to_image, world_to_image, View};
+use crate::transform::{
+    background_rect, image_rect_of_world, spot_view, world_len_to_image, world_rect_of_image,
+    world_to_image, Projection, SpotView, View,
+};
 
 const CANVAS: f32 = MAP_IMAGE_RESOLUTION as f32;
 /// `Map.CompassSize = MapImageResolution / 8`.
@@ -309,11 +315,44 @@ fn draws_border(mode: VolumeDrawMode) -> bool {
     matches!(mode, VolumeDrawMode::Border | VolumeDrawMode::Both)
 }
 
-/// Spotlight tiles intentionally skipped: the high-res tile image set is out
-/// of scope, so there is nothing to composite (`Map.Draw` calls
-/// `DrawSpotlightTiles` right after the background; every transform here
-/// uses the full-canvas scale instead).
-fn draw_spotlight_tiles_stub() {}
+/// Port of `Map.DrawSpotlightTiles` (`Map.cs:344-401`): tiles covering the
+/// full-image rect mapped to world coords, each drawn at its own rect.
+/// Missing tiles are skipped (`GetSpotlightTileImage` returns null outside
+/// pre-rendered space). The caller gates on spotlight-enabled + `Render`
+/// background; parallel pre-caching and cancellation/progress reporting
+/// have no equivalent here.
+fn draw_spotlight_tiles(
+    img: &mut tiny_skia::Pixmap,
+    assets: &mut Assets,
+    space: &Space,
+    view: &impl Projection,
+) {
+    let (left, top, width, height) = world_rect_of_image(view, 0.0, 0.0, CANVAS, CANVAS);
+    for tile in SpotlightTile::tiles_in_rect(left, top, width, height, space) {
+        // Stream one tile at a time (decode → blit → drop): a decoded tile
+        // is ~67MB and a full-canvas render touches hundreds of them, so
+        // the cached lookup would OOM (see `spotlight_tile_uncached`).
+        let raster = assets
+            .spotlight_tile_uncached(
+                tile.space.editor_id(),
+                i64::from(tile.x_id()),
+                i64::from(tile.y_id()),
+            )
+            .map(|rgba| pixmap_from_image(&rgba));
+        let Some(raster) = raster else {
+            continue;
+        };
+        let (tx, ty, tw, th) = tile.rectangle();
+        let (ix, iy, iw, ih) = image_rect_of_world(
+            view,
+            f64::from(tx),
+            f64::from(ty),
+            f64::from(tw),
+            f64::from(th),
+        );
+        blit(img, &raster, ix, iy, iw, ih);
+    }
+}
 
 fn settings_background_kind(kind: BackgroundImageType) -> BackgroundKind {
     match kind {
@@ -327,6 +366,39 @@ fn settings_background_kind(kind: BackgroundImageType) -> BackgroundKind {
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
+
+/// Active world→image projection for one render: full-space, or the zoomed
+/// spotlight view. Mirrors the C# `GetWorldCenter` / `GetWorldToImageFactor`
+/// spotlight branches (`Map.cs:1241-1254`): when spotlight is enabled the
+/// center is the spotlight location and the factor is
+/// `SpotlightSize * TileWidth / 4096`, while every formula stays identical.
+enum ActiveView {
+    Space(View),
+    Spot(SpotView),
+}
+
+impl Projection for ActiveView {
+    fn center_x(&self) -> f64 {
+        match self {
+            Self::Space(view) => view.center_x(),
+            Self::Spot(view) => view.center_x(),
+        }
+    }
+
+    fn center_y(&self) -> f64 {
+        match self {
+            Self::Space(view) => view.center_y(),
+            Self::Spot(view) => view.center_y(),
+        }
+    }
+
+    fn factor(&self) -> f64 {
+        match self {
+            Self::Space(view) => view.factor(),
+            Self::Spot(view) => view.factor(),
+        }
+    }
+}
 
 /// Port of `Map.Draw` (`Map.cs:122-209`) for Standard mode
 /// (`DrawStandardPlots(topographic = false)`).
@@ -343,23 +415,45 @@ pub fn draw(input: DrawInput<'_>) -> Result<tiny_skia::Pixmap, DrawError> {
         return Err(DrawError::UnsupportedPlotMode(format!("{:?}", plot.mode)));
     }
 
-    let view = View::for_space(&space);
+    // `GetWorldCenter` / `GetWorldToImageFactor` (`Map.cs:1241-1254`):
+    // spotlight swaps in the spotlight location and `size * TileWidth`
+    // range, so the entire map (background, tiles, grid, plots, markers)
+    // zooms through one projection.
+    let view = if map.spotlight_enabled {
+        ActiveView::Spot(spot_view(
+            (map.spotlight_location.x, map.spotlight_location.y),
+            map.spotlight_size,
+        ))
+    } else {
+        ActiveView::Space(View::for_space(&space))
+    };
+    let spotlight = match &view {
+        ActiveView::Spot(spot) => Some(spot),
+        ActiveView::Space(_) => None,
+    };
     let font = Font::from_bytes(&assets.font_bytes());
 
     // Empty 4096 canvas (transparent; mirrors `new Bitmap(EmptyMapImage)`).
     let mut img = tiny_skia::Pixmap::new(MAP_IMAGE_RESOLUTION as u32, MAP_IMAGE_RESOLUTION as u32)
         .expect("valid canvas size");
 
-    // Background stretched to the full rect (missing -> leave empty).
+    // Background at the scaled rect (`GetScaledMapBackgroundRect`,
+    // `Map.cs:1310-1318`): full canvas normally, the space rect mapped
+    // through the spotlight projection when enabled (missing -> empty).
     if map.background_image != BackgroundImageType::None {
         let kind = settings_background_kind(map.background_image);
         let bg = assets.background(&space, &kind).map(pixmap_from_image);
         if let Some(bg) = bg {
-            blit(&mut img, &bg, 0.0, 0.0, CANVAS, CANVAS);
+            let (bx, by, bw, bh) = background_rect(&space, spotlight);
+            blit(&mut img, &bg, bx, by, bw, bh);
         }
     }
 
-    draw_spotlight_tiles_stub();
+    // `DrawSpotlightTiles` (`Map.cs:134,344-401`): only when spotlight is
+    // enabled AND the background is Render.
+    if map.spotlight_enabled && map.background_image == BackgroundImageType::Render {
+        draw_spotlight_tiles(&mut img, assets, &space, &view);
+    }
 
     // Compass rose (512px canvas, rotated, top-right).
     let compass_useful = map.compass_style == CompassStyle::Always
@@ -380,11 +474,12 @@ pub fn draw(input: DrawInput<'_>) -> Result<tiny_skia::Pixmap, DrawError> {
     // Brightness/grayscale over the whole canvas.
     adjust_canvas(&mut img, map.brightness, map.grayscale_background);
 
-    // Water mask overlay.
+    // Water mask overlay (same scaled rect as the background, `Map.cs:144`).
     if map.highlight_water && space.is_worldspace {
         let mask = assets.water_mask(&space).map(pixmap_from_image);
         if let Some(mask) = mask {
-            blit(&mut img, &mask, 0.0, 0.0, CANVAS, CANVAS);
+            let (bx, by, bw, bh) = background_rect(&space, spotlight);
+            blit(&mut img, &mask, bx, by, bw, bh);
         }
     }
 
@@ -432,25 +527,74 @@ pub fn draw(input: DrawInput<'_>) -> Result<tiny_skia::Pixmap, DrawError> {
 // Compass/grid/infestations/markers
 // ---------------------------------------------------------------------------
 
+/// Port of the `SpotlightEnabled` grid setup (`Map.cs:255-280`):
+/// `viewRange = SpotlightTileSize * size`, `gridSize` snapped to a power
+/// of two against `target_intervals`, bounds from snap factors off the
+/// spotlight location (both sides add `gridSize + (location % gridSize)`,
+/// then `spotlightRange = size * SpotlightTileSize` beyond that).
+/// Returns `(grid_size, min_x, max_x, min_y, max_y)`.
+fn spotlight_grid_bounds(
+    location: (f64, f64),
+    size: f64,
+    target_intervals: f64,
+) -> (f64, f64, f64, f64, f64) {
+    let view_range = f64::from(SPOTLIGHT_TILE_SIZE) * size;
+    let grid_size = 2f64.powf((view_range / target_intervals).log2().round());
+    let spotlight_range = size * f64::from(SPOTLIGHT_TILE_SIZE);
+    let snap_x = grid_size + (location.0 % grid_size);
+    let snap_y = grid_size + (location.1 % grid_size);
+    (
+        grid_size,
+        location.0 - snap_x - spotlight_range,
+        location.0 + snap_x + spotlight_range,
+        location.1 - snap_y - spotlight_range,
+        location.1 + snap_y + spotlight_range,
+    )
+}
+
+/// Port of the `SpotlightEnabled` watermark range/center (`Map.cs:1036-1050`):
+/// `range = (int)size * SpotlightTileSize` (the cast binds tighter than
+/// `*`), center truncates the spotlight location like the C# `(int)` casts.
+/// Returns `(range, center_x, center_y)`.
+fn spotlight_watermark_values(size: f64, location: (f64, f64)) -> (i32, i32, i32) {
+    (
+        (size as i32) * SPOTLIGHT_TILE_SIZE,
+        location.0 as i32,
+        location.1 as i32,
+    )
+}
+
 fn draw_coordinate_grid(
     img: &mut tiny_skia::Pixmap,
     font: &Font,
     map: &MapSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
 ) {
-    // Spotlight branch omitted (spotlight is out of scope).
     let target_intervals = match map.coordinate_grid_precision {
         CoordinateGridPrecision::Fine => 40.0,
         CoordinateGridPrecision::Medium => 20.0,
         CoordinateGridPrecision::Large => 10.0,
     };
-    let view_range = space.max_range;
-    let grid_size = 2f64.powf((view_range / target_intervals).log2().round());
-    let min_x = space.min_x() - (grid_size + (space.min_x() % grid_size));
-    let max_x = space.max_x() + (grid_size - (space.max_x() % grid_size));
-    let min_y = space.min_y() - (grid_size + (space.min_y() % grid_size));
-    let max_y = space.max_y() + (grid_size - (space.max_y() % grid_size));
+    // `Map.cs:255-280`: spotlight anchors the grid to the spotlight
+    // location/size instead of the space rect.
+    let (grid_size, min_x, max_x, min_y, max_y) = if map.spotlight_enabled {
+        spotlight_grid_bounds(
+            (map.spotlight_location.x, map.spotlight_location.y),
+            map.spotlight_size,
+            target_intervals,
+        )
+    } else {
+        let view_range = space.max_range;
+        let grid_size = 2f64.powf((view_range / target_intervals).log2().round());
+        (
+            grid_size,
+            space.min_x() - (grid_size + (space.min_x() % grid_size)),
+            space.max_x() + (grid_size - (space.max_x() % grid_size)),
+            space.min_y() - (grid_size + (space.min_y() % grid_size)),
+            space.max_y() + (grid_size - (space.max_y() % grid_size)),
+        )
+    };
 
     let px = (map.font_settings.size_coordinate_grid) as f32;
 
@@ -507,7 +651,7 @@ fn draw_infestations(
     img: &mut tiny_skia::Pixmap,
     assets: &mut Assets,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
 ) -> Result<(), DrawError> {
     let radius = db::infestation_radius(conn)? as f32;
     for location in instances::infestation_locations(conn, space)? {
@@ -537,7 +681,7 @@ fn draw_map_markers(
     assets: &mut Assets,
     map: &MapSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
 ) -> Result<(), DrawError> {
     let px = (map.font_settings.size_map_marker_label) as f32;
     for marker in db::map_markers_for_space(conn, space.form_id())? {
@@ -580,7 +724,7 @@ fn draw_standard_plots(
     map: &MapSettings,
     plot: &PlotSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
     items: &[Plottable],
 ) -> Result<(), DrawError> {
     for item in items {
@@ -631,7 +775,7 @@ fn draw_region(
     item: &Plottable,
     map: &MapSettings,
     plot: &PlotSettings,
-    view: &View,
+    view: &impl Projection,
     conn: &Connection,
 ) -> Result<(), DrawError> {
     let item_space = item.result.space().clone();
@@ -678,7 +822,7 @@ fn draw_location(
     instance: &mappalachia_core::model::Instance,
     item: &Plottable,
     plot: &PlotSettings,
-    view: &View,
+    view: &impl Projection,
     conn: &Connection,
 ) -> Result<(), DrawError> {
     let item_space = item.result.space().clone();
@@ -738,7 +882,7 @@ fn draw_primitive_shape(
     instance: &mappalachia_core::model::Instance,
     color: Rgba,
     mode: VolumeDrawMode,
-    view: &View,
+    view: &impl Projection,
 ) {
     let shape = instance.primitive_shape.expect("shape branch has a shape");
     let (cx, cy) = world_to_image(view, instance.coord.x, instance.coord.y);
@@ -780,7 +924,7 @@ fn draw_instance_form_ids(
     font: &Font,
     map: &MapSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
     items: &[Plottable],
 ) -> Result<(), DrawError> {
     let _ = space;
@@ -816,7 +960,7 @@ fn draw_connecting_space_plots(
     map: &MapSettings,
     plot: &PlotSettings,
     space: &Space,
-    view: &View,
+    view: &impl Projection,
     items: &[Plottable],
 ) -> Result<(), DrawError> {
     let selected_teleporters = instances::teleporters(conn, space)?;
@@ -916,10 +1060,21 @@ fn draw_watermark(
         text.push_str(" (Instanced)");
     }
     if map.show_coordinate_grid {
-        text = format!(
-            "Range: {}\nCenter: {}, {}\n{text}",
-            space.max_range as i32, space.center_x as i32, space.center_y as i32
-        );
+        // `Map.cs:1036-1050`: spotlight reports the tile range and the
+        // truncated spotlight location instead of the space range/center.
+        let (range, center_x, center_y) = if map.spotlight_enabled {
+            spotlight_watermark_values(
+                map.spotlight_size,
+                (map.spotlight_location.x, map.spotlight_location.y),
+            )
+        } else {
+            (
+                space.max_range as i32,
+                space.center_x as i32,
+                space.center_y as i32,
+            )
+        };
+        text = format!("Range: {range}\nCenter: {center_x}, {center_y}\n{text}");
     }
     text.push_str(&format!(
         "\nGame Version {} | Made with Mappalachia: github.com/AHeroicLlama/Mappalachia",
@@ -1092,4 +1247,38 @@ fn draw_legend(
     }
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{spotlight_grid_bounds, spotlight_watermark_values};
+
+    #[test]
+    fn spotlight_grid_bounds_match_csharp_math() {
+        // Hand-computed from `Map.cs:255-280`: size 2, Medium precision (20
+        // target intervals): viewRange = 4096 * 2 = 8192,
+        // gridSize = 2^round(log2(8192 / 20)) = 2^9 = 512,
+        // snapX = 512 + (-500 % 512) = 12,
+        // snapY = 512 + (135 % 512) = 647, range = 2 * 4096 = 8192.
+        let (grid, min_x, max_x, min_y, max_y) = spotlight_grid_bounds((-500.0, 135.0), 2.0, 20.0);
+        assert_eq!(grid, 512.0);
+        assert_eq!((min_x, max_x), (-8704.0, 7704.0));
+        assert_eq!((min_y, max_y), (-8704.0, 8974.0));
+    }
+
+    #[test]
+    fn spotlight_watermark_truncates_like_csharp_casts() {
+        // `Map.cs:1038-1041`: `range = (int)size * SpotlightTileSize` (the
+        // cast binds tighter than `*`), center truncates the location.
+        assert_eq!(
+            spotlight_watermark_values(2.0, (-500.9, 135.9)),
+            (8192, -500, 135)
+        );
+        // A fractional size truncates BEFORE the multiply: (int)2.9 * 4096.
+        assert_eq!(spotlight_watermark_values(2.9, (0.0, 0.0)), (8192, 0, 0));
+    }
 }

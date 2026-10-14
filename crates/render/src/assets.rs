@@ -9,6 +9,10 @@
 //! - `GetPlotIconImage` / `GetAvailablePlotIconCount`: `img/icon/*.png`
 //!   sorted alphabetically (deterministic; C# `GetFiles` order is
 //!   platform-defined), out-of-range index falls back to index 0.
+//! - `GetSpotlightTileImage`: `img/spotlight/<EditorID>/<XId>.<YId>.jpg`
+//!   (missing file yields `None` — the caller skips the tile).
+//! - `IsSpotlightInstalled`: any non-0-byte jpg in any `img/spotlight`
+//!   subfolder.
 //! - Font: `font/futura_condensed_bold.otf`.
 //!
 //! Missing optional images (`None` kind, absent file) yield `None` — the
@@ -245,6 +249,66 @@ impl Assets {
     /// Mirrors `GetAvailablePlotIconCount` (release ships 7: `A.png..G.png`).
     pub fn plot_icon_count(&self) -> usize {
         self.plot_icons.len()
+    }
+
+    /// Mirrors `GetSpotlightTileImage` (`FileIO.cs:159-179`):
+    /// `img/spotlight/<EditorID>/<XId>.<YId>.jpg` (`XId`/`YId` signed
+    /// ints, C# int formatting). A missing/unreadable file yields `None`
+    /// (the caller skips the tile — common outside playable space).
+    pub fn spotlight_tile(
+        &mut self,
+        space_editor: &str,
+        x_id: i64,
+        y_id: i64,
+    ) -> Option<&image::RgbaImage> {
+        let rel = format!("img/spotlight/{space_editor}/{x_id}.{y_id}.jpg");
+        let path = self.resolve(&rel)?;
+        self.load_cached(&path)
+    }
+
+    /// Same tile lookup as [`Assets::spotlight_tile`] but WITHOUT caching:
+    /// decode, return owned, caller drops right after blitting. A decoded
+    /// 4096² tile is ~67MB and a full-canvas Appalachia render touches ~460
+    /// of them — retaining all of them (C#'s static
+    /// `SpotlightTileImageCache` survives on a Windows pagefile) OOMs this
+    /// host, so the render loop streams through this instead. Output pixels
+    /// are identical; only peak RSS changes.
+    pub fn spotlight_tile_uncached(
+        &self,
+        space_editor: &str,
+        x_id: i64,
+        y_id: i64,
+    ) -> Option<image::RgbaImage> {
+        let rel = format!("img/spotlight/{space_editor}/{x_id}.{y_id}.jpg");
+        let path = self.resolve(&rel)?;
+        image::open(path).ok().map(|img| img.to_rgba8())
+    }
+
+    /// Mirrors `IsSpotlightInstalled` (`FileIO.cs:70-100`): any non-0-byte
+    /// jpg in any `img/spotlight` subfolder.
+    pub fn is_spotlight_installed(&self) -> bool {
+        let Ok(subs) = std::fs::read_dir(self.img("img/spotlight")) else {
+            return false;
+        };
+        for sub in subs.filter_map(|e| e.ok()) {
+            if !sub.path().is_dir() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(sub.path()) else {
+                continue;
+            };
+            for file in files.filter_map(|e| e.ok()) {
+                let is_jpg = file
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"));
+                let is_file = file.file_type().is_ok_and(|t| t.is_file());
+                if is_jpg && is_file && file.metadata().is_ok_and(|m| m.len() > 0) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Raw bytes of `font/futura_condensed_bold.otf` (mirrors the

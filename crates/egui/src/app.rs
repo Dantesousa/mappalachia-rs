@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use mappalachia_core::{
-    common::MAP_IMAGE_RESOLUTION,
+    common::{MAP_IMAGE_RESOLUTION, SPOTLIGHT_MAX_SIZE},
     db,
     enums::{LockLevel, Signature},
     instances,
-    model::{EntityKind, Space},
+    model::{Coord, EntityKind, Space},
     recipe::{load_recipe_file, MapSettingsStub, PlotSettingsStub, Recipe},
     search::{search, Grouped, SearchParams, SearchResult},
 };
@@ -15,11 +15,14 @@ use mappalachia_render::{
     draw::{draw, DrawInput, Plottable},
     icon::PlotIcon,
     settings::{
-        map_from_value, plot_from_value, BackgroundImageType, CompassStyle,
-        LegendHorizontalAlignment, LegendStyle, LegendVerticalAlignment, MapSettings, PlotMode,
-        PlotSettings, PlotStyleSettings,
+        clamp_spotlight_size, is_suitable_for_spotlight, map_from_value, plot_from_value,
+        spotlight_size_cap, BackgroundImageType, CompassStyle, LegendHorizontalAlignment,
+        LegendStyle, LegendVerticalAlignment, MapSettings, PlotMode, PlotSettings,
+        PlotStyleSettings,
     },
 };
+
+use crate::spotlight_dl::{DlProgress, DlState};
 
 /// `FileIO.GetAvailablePlotIconCount`: the release tree ships 7 base icons
 /// (`A.png..G.png`; cf. `render::icon::PlotIcon::assign` docs).
@@ -133,6 +136,24 @@ pub struct App {
     pub show_markers: bool,
     /// `MapSettings.ShowInfestations` (C# default off).
     pub show_infestations: bool,
+    /// `MapSettings.SpotlightEnabled` (C# default off). Enabling with no
+    /// spotlight data installed keeps the flag but reports a status hint
+    /// (mirrors `Notify.SpotlightInstallationPrompt`); enabling with data
+    /// installed flips [`App::background`] to `Render`, restoring the
+    /// previous value on disable (see
+    /// [`App::set_spotlight_enabled`]).
+    pub spotlight_enabled: bool,
+    /// Background to restore when spotlight is disabled (C#
+    /// `backgroundImagePreSpotlight`). Not render-affecting itself, so it
+    /// stays out of the settings fingerprint.
+    background_pre_spotlight: BackgroundImageType,
+    /// `MapSettings.SpotlightSize` in tiles (C# default 2; clamped
+    /// `1..=cap` per space via [`App::set_spotlight_size`]).
+    pub spotlight_size: f64,
+    /// `MapSettings.SpotlightLocation` (default = space center; plain
+    /// assignment, never auto-flushes — tile-cache ownership lives in
+    /// `Assets`, cf. the C# `SpotlightLocation` setter flush).
+    pub spotlight_location: (f64, f64),
     /// Plot style (C# defaults: size 50, 8-color palette); display-only in
     /// v1, editable in a later task.
     pub plot_style: PlotStyleSettings,
@@ -189,6 +210,19 @@ pub struct App {
     pub interiors: Vec<InteriorHit>,
     /// Editor id of the item [`App::interiors`] was searched for.
     pub interiors_for: String,
+    /// Spotlight downloader lifecycle (Task 5), driven by the worker in
+    /// [`crate::spotlight_dl`]; the panel renders it, [`App::poll_spotlight_dl`]
+    /// folds worker events into it once per frame.
+    pub dl_state: DlState,
+    /// Live channel while the download worker runs; `None` otherwise.
+    /// Dropping it is the cancel signal (worker aborts on first failed
+    /// send). Never touched off-thread.
+    dl_rx: Option<std::sync::mpsc::Receiver<DlProgress>>,
+    /// Cached [`App::is_spotlight_installed`] probe: the check walks the
+    /// tile tree, so the per-frame install-state line reads this instead.
+    /// Invalidated on download Done/cancel/fail (the only in-app path that
+    /// changes the tree); `None` means "probe on next read".
+    spotlight_installed_cache: Option<bool>,
 }
 
 /// Preview lifecycle: idle, worker running, uploaded texture, or worker
@@ -266,6 +300,10 @@ impl App {
         };
         let space_idx = spaces.iter().position(|s| s.is_appalachia()).unwrap_or(0);
         let filename = recommended_stem("", spaces.get(space_idx));
+        let spotlight_location = spaces
+            .get(space_idx)
+            .map(|s| (s.center_x, s.center_y))
+            .unwrap_or((0.0, 0.0));
         Self {
             db_path,
             assets_root,
@@ -291,6 +329,10 @@ impl App {
             show_grid: false,
             show_markers: false,
             show_infestations: false,
+            spotlight_enabled: false,
+            background_pre_spotlight: BackgroundImageType::Menu,
+            spotlight_size: 2.0,
+            spotlight_location,
             plot_style: PlotStyleSettings::default(),
             plot_mode: PlotMode::Standard,
             preview: PreviewState::Idle,
@@ -306,6 +348,9 @@ impl App {
             dirty: false,
             interiors: Vec::new(),
             interiors_for: String::new(),
+            dl_state: DlState::Idle,
+            dl_rx: None,
+            spotlight_installed_cache: None,
         }
     }
 
@@ -328,6 +373,9 @@ impl App {
             map_marker_icons: self.show_markers,
             map_marker_labels: self.show_markers,
             show_infestations: self.show_infestations,
+            spotlight_enabled: self.spotlight_enabled,
+            spotlight_size: self.spotlight_size,
+            spotlight_location: Coord::new(self.spotlight_location.0, self.spotlight_location.1),
             ..MapSettings::default()
         };
         let plot = PlotSettings {
@@ -427,6 +475,148 @@ impl App {
                 self.preview = PreviewState::Failed(msg);
             }
         }
+    }
+
+    /// Spawn the spotlight download worker: downloads both 7z volumes with
+    /// progress, stage-extracts via [`crate::spotlight_dl`] (verified, then
+    /// promoted into `<assets>/img/spotlight`), and verifies. Progress
+    /// comes back over an `mpsc` channel folded in
+    /// by [`App::poll_spotlight_dl`] on the UI thread — the same pattern as
+    /// the preview worker, and the `egui::Context` is never touched
+    /// off-thread. No-op while a download runs or `assets_root` is unset
+    /// (status explains the latter).
+    pub fn start_spotlight_download(&mut self) {
+        if self.dl_rx.is_some() {
+            return;
+        }
+        let Some(root) = self.assets_root.clone() else {
+            self.status = "Cannot download: MAPPALACHIA_ASSETS not set.".to_string();
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<DlProgress>();
+        self.dl_rx = Some(rx);
+        self.dl_state = DlState::Downloading {
+            file_idx: 1,
+            bytes_done: 0,
+            bytes_total: crate::spotlight_dl::SPOTLIGHT_SIZE_001,
+        };
+        let root = PathBuf::from(root);
+        std::thread::spawn(move || crate::spotlight_dl::run(&root, tx));
+    }
+
+    /// Cancel an in-flight download: drops the channel (the worker aborts
+    /// on its next send) and best-effort removes the temp and staging dirs
+    /// (partial tiles only ever land in staging, never the live tree).
+    /// No-op when idle. Reports via `status`; the install cache is dropped
+    /// since a racing worker may still be cleaning up.
+    pub fn cancel_spotlight_download(&mut self) {
+        if self.dl_rx.is_none() {
+            return;
+        }
+        self.dl_rx = None;
+        self.dl_state = DlState::Idle;
+        if let Some(root) = self.assets_root.clone() {
+            crate::spotlight_dl::clean_dl_dir(Path::new(&root));
+            crate::spotlight_dl::clean_staging_dir(Path::new(&root));
+        }
+        self.invalidate_spotlight_cache();
+        self.status = "Spotlight download cancelled.".to_string();
+    }
+
+    /// Poll the download worker (call once per frame from `update` alongside
+    /// [`App::poll_preview`]): folds every queued event into
+    /// [`App::dl_state`], keeps repainting while active, and finishes via
+    /// [`App::on_spotlight_download_done`] / failure status. State-level
+    /// except the repaint nudge, so tests drive the transitions through
+    /// [`DlState::apply`] directly.
+    fn poll_spotlight_dl(&mut self, ctx: &egui::Context) {
+        enum Outcome {
+            None,
+            Pending,
+            Terminal(Terminal),
+        }
+        enum Terminal {
+            Done,
+            Failed(String),
+            Died,
+        }
+        let outcome = match &self.dl_rx {
+            None => Outcome::None,
+            Some(rx) => {
+                let mut terminal = None;
+                loop {
+                    match rx.try_recv() {
+                        Ok(progress) => {
+                            if matches!(progress, DlProgress::Done | DlProgress::Failed(_)) {
+                                terminal = Some(match progress {
+                                    DlProgress::Done => Terminal::Done,
+                                    DlProgress::Failed(message) => Terminal::Failed(message),
+                                    _ => unreachable!("matched above"),
+                                });
+                                break;
+                            }
+                            self.dl_state.apply(progress);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            terminal = Some(Terminal::Died);
+                            break;
+                        }
+                    }
+                }
+                match terminal {
+                    Some(t) => Outcome::Terminal(t),
+                    None => Outcome::Pending,
+                }
+            }
+        };
+        match outcome {
+            Outcome::None => {}
+            Outcome::Pending => ctx.request_repaint(),
+            Outcome::Terminal(Terminal::Done) => {
+                self.dl_rx = None;
+                self.on_spotlight_download_done();
+            }
+            Outcome::Terminal(Terminal::Failed(message)) => {
+                self.dl_rx = None;
+                self.dl_state = DlState::Failed(message.clone());
+                self.invalidate_spotlight_cache();
+                self.status = message;
+            }
+            Outcome::Terminal(Terminal::Died) => {
+                self.dl_rx = None;
+                let message = "Spotlight download worker died.".to_string();
+                self.dl_state = DlState::Failed(message.clone());
+                self.invalidate_spotlight_cache();
+                self.status = message;
+            }
+        }
+    }
+
+    /// Finish a verified download: refresh the install cache, cap the size
+    /// to the current space, and auto-enable spotlight (background flips to
+    /// `Render`, like a manual enable with data installed — including when
+    /// the flag was already set without data, where the plain setter would
+    /// no-op). Reports via `status`.
+    fn on_spotlight_download_done(&mut self) {
+        self.dl_state = DlState::Done;
+        self.invalidate_spotlight_cache();
+        let installed = self.spotlight_installed_cached();
+        self.cap_spotlight_size();
+        if self.spotlight_enabled {
+            // Already on (enabled pre-install): the flag setter would
+            // no-op, so flip the background directly.
+            self.background = BackgroundImageType::Render;
+            self.invalidate_preview();
+        } else {
+            self.set_spotlight_enabled(true);
+        }
+        self.status = if installed {
+            "Spotlight installed and enabled.".to_string()
+        } else {
+            // Unreachable: the worker verified — defensive only.
+            "Spotlight download finished but tiles were not found.".to_string()
+        };
     }
 
     /// Mirrors the `FormMain` search flow: `core::search` with the default
@@ -696,9 +886,142 @@ impl App {
             return;
         };
         let (idx, name) = (hit.space_idx, hit.display_name.clone());
-        self.space_idx = idx;
-        self.invalidate_preview();
+        self.set_space_idx(idx);
         self.status = format!("Switched to {name}.");
+    }
+
+    /// The current full-DB space, if any is loaded.
+    fn current_space(&self) -> Option<&Space> {
+        self.spaces.get(self.space_idx)
+    }
+
+    /// Mirrors C# `FileIO.IsSpotlightInstalled` for the configured asset
+    /// root: false when `assets_root` is unset. Pure state query (opens a
+    /// throwaway [`Assets`] handle, no caching) so tests and the download
+    /// worker share it.
+    pub fn is_spotlight_installed(&self) -> bool {
+        match &self.assets_root {
+            Some(root) => Assets::open(root).is_spotlight_installed(),
+            None => false,
+        }
+    }
+
+    /// Cached install probe for the per-frame install-state line: the raw
+    /// check walks the tile tree, so this caches it and only re-probes
+    /// after [`App::invalidate_spotlight_cache`].
+    pub fn spotlight_installed_cached(&mut self) -> bool {
+        if let Some(cached) = self.spotlight_installed_cache {
+            return cached;
+        }
+        let installed = self.is_spotlight_installed();
+        self.spotlight_installed_cache = Some(installed);
+        installed
+    }
+
+    /// Drop the cached install probe (download Done/cancel/fail — the only
+    /// in-app paths that can change the tile tree).
+    fn invalidate_spotlight_cache(&mut self) {
+        self.spotlight_installed_cache = None;
+    }
+
+    /// Mirrors C# `Space.IsSuitableForSpotlight` for the current space
+    /// (false when no spaces are loaded).
+    pub fn is_spotlight_suitable(&self) -> bool {
+        self.current_space().is_some_and(is_suitable_for_spotlight)
+    }
+
+    /// Upper end of the GUI size slider for the current space (`16` when
+    /// no space is loaded).
+    pub fn spotlight_cap(&self) -> f64 {
+        self.current_space()
+            .map(spotlight_size_cap)
+            .unwrap_or(f64::from(SPOTLIGHT_MAX_SIZE))
+    }
+
+    /// Enable/disable spotlight (C# `MapSettings.SpotlightEnabled`
+    /// setter): enabling with no data installed keeps the flag but
+    /// reports a status hint (mirrors
+    /// `Notify.SpotlightInstallationPrompt`); enabling with data
+    /// installed flips the background to `Render`, and disabling
+    /// restores the background from before enabling. No-op when the flag
+    /// is unchanged. Invalidates the preview otherwise.
+    pub fn set_spotlight_enabled(&mut self, enabled: bool) {
+        if enabled == self.spotlight_enabled {
+            return;
+        }
+        let installed = self.spotlight_installed_cached();
+        if enabled && !self.spotlight_enabled {
+            self.background_pre_spotlight = self.background;
+        }
+        if !enabled && self.spotlight_enabled {
+            self.background = self.background_pre_spotlight;
+        }
+        if enabled && !self.spotlight_enabled && installed {
+            self.background = BackgroundImageType::Render;
+        }
+        self.spotlight_enabled = enabled;
+        if enabled && !installed {
+            self.status =
+                "Spotlight is not installed! Unable to be used. Please install it and try again."
+                    .to_string();
+        }
+        self.invalidate_preview();
+    }
+
+    /// Set the map background (C# `MapSettings.BackgroundImage` setter):
+    /// while spotlight is on, a manual change also becomes the restore
+    /// value for disable (C# stores `backgroundImagePreSpotlight` on every
+    /// set, not just on enable). The settings panel routes through here;
+    /// no-op when unchanged. Invalidates otherwise.
+    pub fn set_background(&mut self, background: BackgroundImageType) {
+        if background == self.background {
+            return;
+        }
+        self.background = background;
+        if self.spotlight_enabled {
+            self.background_pre_spotlight = background;
+        }
+        self.invalidate_preview();
+    }
+
+    /// Clamp + store the spotlight size for the current space (`1..=cap`;
+    /// C# `SpotlightSize` + `CapSpotlightSizeToSpace`). Invalidates.
+    pub fn set_spotlight_size(&mut self, size: f64) {
+        match self.current_space().cloned() {
+            Some(space) => self.spotlight_size = clamp_spotlight_size(size, &space),
+            None => self.spotlight_size = size.clamp(1.0, f64::from(SPOTLIGHT_MAX_SIZE)),
+        }
+        self.invalidate_preview();
+    }
+
+    /// Clamp the stored size to the current space without invalidating
+    /// (the space-combo path invalidates via the settings fingerprint).
+    fn cap_spotlight_size(&mut self) {
+        if let Some(space) = self.current_space().cloned() {
+            self.spotlight_size = clamp_spotlight_size(self.spotlight_size, &space);
+        }
+    }
+
+    /// Switch the current space: bounds-checked, caps the spotlight size
+    /// to the new space (C# `CapSpotlightSizeToSpace on space change`),
+    /// and invalidates. Out-of-range indexes are a no-op.
+    pub fn set_space_idx(&mut self, idx: usize) {
+        if idx >= self.spaces.len() {
+            return;
+        }
+        self.space_idx = idx;
+        self.cap_spotlight_size();
+        self.invalidate_preview();
+    }
+
+    /// Reset the spotlight location to the current space center (C#
+    /// `SetSpotlightToMapCenter`). No-op without spaces. Invalidates.
+    pub fn reset_spotlight_to_center(&mut self) {
+        let Some(space) = self.current_space() else {
+            return;
+        };
+        self.spotlight_location = (space.center_x, space.center_y);
+        self.invalidate_preview();
     }
 
     /// Recommended filename stem for the current map (mirrors
@@ -853,6 +1176,17 @@ impl App {
         // v1 has a single markers toggle driving both C# flags.
         self.show_markers = map.map_marker_icons || map.map_marker_labels;
         self.show_infestations = map.show_infestations;
+        self.spotlight_enabled = map.spotlight_enabled;
+        // Restore semantics (chosen): opening a recipe treats its stored
+        // background as the pre-spotlight baseline, so disabling spotlight
+        // afterwards returns to the recipe's background. The recipe round-trips
+        // the live background (already `Render` when it was saved with
+        // spotlight on), so applying the stored values wholesale is faithful
+        // — no extra flip is needed here.
+        self.background_pre_spotlight = map.background_image;
+        self.spotlight_size = map.spotlight_size;
+        self.spotlight_location = (map.spotlight_location.x, map.spotlight_location.y);
+        self.cap_spotlight_size();
         // Standard-locked until the modes plan: the v1 combo cannot
         // represent the other modes, so clamp (a recipe saved elsewhere may
         // store Topographic/Heatmap/Cluster, which `draw` would reject).
@@ -924,6 +1258,9 @@ struct SettingsFingerprint {
     show_grid: bool,
     show_markers: bool,
     show_infestations: bool,
+    spotlight_enabled: bool,
+    spotlight_size: f64,
+    spotlight_location: (f64, f64),
     plot_mode: PlotMode,
     plot_style: PlotStyleSettings,
 }
@@ -1014,6 +1351,9 @@ impl App {
             show_grid: self.show_grid,
             show_markers: self.show_markers,
             show_infestations: self.show_infestations,
+            spotlight_enabled: self.spotlight_enabled,
+            spotlight_size: self.spotlight_size,
+            spotlight_location: self.spotlight_location,
             plot_mode: self.plot_mode,
             plot_style: self.plot_style.clone(),
         }
@@ -1048,6 +1388,21 @@ fn recommended_stem(title: &str, space: Option<&Space>) -> String {
         Some(s) => sanitize_filename(&format!("Mappalachia Map of {}", s.display_name())),
         None => "Mappalachia Map".to_string(),
     }
+}
+
+/// Clamped 0–1 progress fraction for the download panel bars (0 when the
+/// total is unknown; the extract callback may overshoot past directory
+/// entries, so clamp rather than trust the denominator).
+fn dl_fraction(done: u64, total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    (done as f64 / total as f64).clamp(0.0, 1.0) as f32
+}
+
+/// Mebibytes for the download byte-count readout.
+fn mb(bytes: u64) -> f64 {
+    bytes as f64 / 1_048_576.0
 }
 
 /// Mirrors `FileIO.GetImageFileTypeRecommendation`: JPEG for a worldspace
@@ -1368,9 +1723,11 @@ impl Default for App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_preview(ctx);
+        self.poll_spotlight_dl(ctx);
         // Snapshot before the panels: any settings edit below stales the
         // preview (compared again after the settings panel).
         let settings_before = self.settings_fingerprint();
+        let space_before = self.space_idx;
         egui::SidePanel::left("search_panel")
             .resizable(true)
             .show(ctx, |ui| {
@@ -1475,30 +1832,25 @@ impl eframe::App for App {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.heading("Map");
+                // Routed through the setter (not a direct field write) so a
+                // manual change while spotlight is on also becomes the
+                // disable-restore value (C# `BackgroundImage` setter).
+                let mut background = self.background;
                 egui::ComboBox::from_label("Background")
-                    .selected_text(format!("{:?}", self.background))
+                    .selected_text(format!("{background:?}"))
                     .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut background, BackgroundImageType::Render, "Render");
+                        ui.selectable_value(&mut background, BackgroundImageType::Menu, "Menu");
                         ui.selectable_value(
-                            &mut self.background,
-                            BackgroundImageType::Render,
-                            "Render",
-                        );
-                        ui.selectable_value(
-                            &mut self.background,
-                            BackgroundImageType::Menu,
-                            "Menu",
-                        );
-                        ui.selectable_value(
-                            &mut self.background,
+                            &mut background,
                             BackgroundImageType::Military,
                             "Military",
                         );
-                        ui.selectable_value(
-                            &mut self.background,
-                            BackgroundImageType::None,
-                            "None",
-                        );
+                        ui.selectable_value(&mut background, BackgroundImageType::None, "None");
                     });
+                if background != self.background {
+                    self.set_background(background);
+                }
                 ui.add(egui::Slider::new(&mut self.brightness, 0.1..=2.0).text("Brightness"));
                 ui.horizontal(|ui| {
                     ui.label("Title:");
@@ -1566,6 +1918,103 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.show_markers, "Map markers");
                 ui.checkbox(&mut self.show_infestations, "Infestations");
                 ui.separator();
+                ui.heading("Spotlight");
+                // Cached probe (no per-frame tree walk); invalidated on
+                // download Done/cancel/fail.
+                let installed = self.spotlight_installed_cached();
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Installed: {}",
+                        if installed { "yes" } else { "no" }
+                    ));
+                    // Clone for the match: the arms borrow `self` mutably.
+                    match self.dl_state.clone() {
+                        DlState::Idle => {
+                            if ui.button("Download").clicked() {
+                                self.start_spotlight_download();
+                            }
+                        }
+                        DlState::Failed(message) => {
+                            if ui.button("Retry").clicked() {
+                                self.start_spotlight_download();
+                            }
+                            ui.weak(message);
+                        }
+                        DlState::Done => {
+                            ui.label("up to date.");
+                        }
+                        DlState::Downloading { .. }
+                        | DlState::Extracting { .. }
+                        | DlState::Verifying => {
+                            if ui.button("Cancel").clicked() {
+                                self.cancel_spotlight_download();
+                            }
+                        }
+                    }
+                });
+                // Determinate progress under the button row while active.
+                if self.dl_state.is_active() {
+                    match self.dl_state.clone() {
+                        DlState::Downloading {
+                            file_idx,
+                            bytes_done,
+                            bytes_total,
+                        } => {
+                            ui.add(
+                                egui::ProgressBar::new(dl_fraction(bytes_done, bytes_total))
+                                    .show_percentage(),
+                            );
+                            ui.weak(format!(
+                                "Downloading file {file_idx}/2 — {:.1}/{:.1} MB",
+                                mb(bytes_done),
+                                mb(bytes_total)
+                            ));
+                        }
+                        DlState::Extracting { done, total } => {
+                            ui.add(
+                                egui::ProgressBar::new(dl_fraction(done as u64, total as u64))
+                                    .show_percentage(),
+                            );
+                            ui.weak(format!("Extracting — {done}/{total} files"));
+                        }
+                        DlState::Verifying => {
+                            ui.spinner();
+                            ui.weak("Verifying install…");
+                        }
+                        DlState::Idle | DlState::Done | DlState::Failed(_) => {}
+                    }
+                }
+                let mut enabled = self.spotlight_enabled;
+                if ui.checkbox(&mut enabled, "Spotlight").changed() {
+                    self.set_spotlight_enabled(enabled);
+                }
+                let suitable = self.is_spotlight_suitable();
+                let cap = self.spotlight_cap();
+                if suitable {
+                    let mut size = self.spotlight_size;
+                    if ui
+                        .add(egui::Slider::new(&mut size, 1.0..=cap).text("Size"))
+                        .changed()
+                    {
+                        self.set_spotlight_size(size);
+                    }
+                } else {
+                    ui.add_enabled(
+                        false,
+                        egui::Slider::new(&mut self.spotlight_size, 1.0..=cap).text("Size"),
+                    );
+                    ui.weak("Space too small for spotlight.");
+                }
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Location: ({:.0}, {:.0})",
+                        self.spotlight_location.0, self.spotlight_location.1
+                    ));
+                    if ui.button("Reset to map center").clicked() {
+                        self.reset_spotlight_to_center();
+                    }
+                });
+                ui.separator();
                 ui.heading("Plot");
                 // Standard-locked until the modes plan: the other modes are
                 // visible but disabled, with no code paths behind them.
@@ -1588,6 +2037,12 @@ impl eframe::App for App {
 
         // Any settings edit above stales the preview. The widgets write the
         // fields directly (no setters to hook), so diff the fingerprint.
+        // A space switch also caps the spotlight size to the new space
+        // (C# `CapSpotlightSizeToSpace`); the fingerprint diff below picks
+        // up the invalidation.
+        if self.space_idx != space_before {
+            self.cap_spotlight_size();
+        }
         if self.settings_fingerprint() != settings_before {
             self.invalidate_preview();
         }
@@ -2457,6 +2912,357 @@ mod tests {
         let app = settings_app();
         assert!(app.auto_render, "Auto render defaults ON");
         assert!(!app.dirty, "fresh state is clean");
+    }
+
+    /// Task 4 RED: spotlight state mirroring `Settings/MapSettings.cs`.
+    #[test]
+    fn spotlight_defaults_follow_csharp() {
+        let app = settings_app();
+        assert!(!app.spotlight_enabled);
+        assert_eq!(app.spotlight_size, 2.0);
+        let space = &app.spaces[app.space_idx];
+        assert_eq!(
+            app.spotlight_location,
+            (space.center_x, space.center_y),
+            "default location is the space center"
+        );
+        assert!(
+            !app.is_spotlight_installed(),
+            "no asset root: not installed"
+        );
+    }
+
+    #[test]
+    fn default_spotlight_location_is_space_center() {
+        let space = Space::new(
+            7,
+            "SOMEWHERE",
+            "Somewhere",
+            true,
+            true,
+            123.0,
+            -456.0,
+            100000.0,
+            0.0,
+        );
+        let app = App::from_parts(None, None, vec![space]);
+        assert_eq!(app.spotlight_location, (123.0, -456.0));
+    }
+
+    /// Scratch asset tree with one non-empty spotlight tile, so
+    /// `is_spotlight_installed` passes without the real game data.
+    fn spotlight_tmp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mappalachia-spotlight-{tag}-{}",
+            std::process::id()
+        ));
+        let sub = dir.join("img/spotlight/APPALACHIA");
+        std::fs::create_dir_all(&sub).expect("tmp spotlight tree");
+        std::fs::write(sub.join("0.0.jpg"), [1u8; 16]).expect("tmp tile");
+        dir
+    }
+
+    fn remove_tmp_root(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spotlight_install_probe() {
+        assert!(!settings_app().is_spotlight_installed());
+        let dir = spotlight_tmp_root("probe");
+        let mut app = settings_app();
+        app.assets_root = Some(dir.to_string_lossy().into_owned());
+        assert!(app.is_spotlight_installed());
+        let empty = std::env::temp_dir().join(format!(
+            "mappalachia-spotlight-empty-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&empty).expect("tmp empty tree");
+        app.assets_root = Some(empty.to_string_lossy().into_owned());
+        assert!(!app.is_spotlight_installed());
+        remove_tmp_root(&dir);
+        remove_tmp_root(&empty);
+    }
+
+    #[test]
+    fn enable_without_data_hints_and_keeps_background() {
+        // Mirrors `Notify.SpotlightInstallationPrompt`: the flag is still
+        // set, but the background is left alone and `status` says why.
+        let mut app = settings_app();
+        app.set_spotlight_enabled(true);
+        assert!(app.spotlight_enabled);
+        assert_eq!(app.background, BackgroundImageType::Menu);
+        assert!(
+            app.status.contains("not installed"),
+            "status must hint, got: {}",
+            app.status
+        );
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn enable_with_data_flips_to_render_disable_restores() {
+        let dir = spotlight_tmp_root("flip");
+        let mut app = settings_app();
+        app.assets_root = Some(dir.to_string_lossy().into_owned());
+        app.background = BackgroundImageType::Military;
+        app.set_spotlight_enabled(true);
+        assert!(app.spotlight_enabled);
+        assert_eq!(app.background, BackgroundImageType::Render);
+        app.set_spotlight_enabled(false);
+        assert!(!app.spotlight_enabled);
+        assert_eq!(
+            app.background,
+            BackgroundImageType::Military,
+            "disable restores the pre-spotlight background"
+        );
+        remove_tmp_root(&dir);
+    }
+
+    #[test]
+    fn reset_spotlight_goes_to_map_center() {
+        let mut app = settings_app();
+        app.spotlight_location = (999.0, 999.0);
+        app.dirty = false;
+        app.reset_spotlight_to_center();
+        let space = &app.spaces[app.space_idx];
+        assert_eq!(app.spotlight_location, (space.center_x, space.center_y));
+        assert!(app.dirty);
+        // No spaces: no-op, never panics.
+        let mut empty = App::from_parts(None, None, Vec::new());
+        empty.reset_spotlight_to_center();
+        assert_eq!(empty.spotlight_location, (0.0, 0.0));
+    }
+
+    #[test]
+    fn spotlight_size_clamps_to_space_cap() {
+        // settings_app space: range 100000 -> benefit ~12.2 -> cap 12.
+        let mut app = settings_app();
+        assert_eq!(app.spotlight_cap(), 12.0);
+        app.set_spotlight_size(99.0);
+        assert_eq!(app.spotlight_size, 12.0);
+        app.set_spotlight_size(0.5);
+        assert_eq!(app.spotlight_size, 1.0);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn set_space_idx_caps_size_and_ignores_out_of_range() {
+        let big = Space::new(1, "BIG", "Big", true, true, 0.0, 0.0, 100000.0, 0.0);
+        let tiny = Space::new(2, "TINY", "Tiny", false, false, 0.0, 0.0, 1000.0, 0.0);
+        let mut app = App::from_parts(None, None, vec![big, tiny]);
+        app.set_spotlight_size(12.0);
+        assert_eq!(app.spotlight_size, 12.0);
+        app.set_space_idx(1);
+        assert_eq!(app.space_idx, 1);
+        assert_eq!(app.spotlight_size, 1.0, "switching space caps the size");
+        app.set_space_idx(99);
+        assert_eq!(app.space_idx, 1, "out-of-range switch is a no-op");
+        assert_eq!(app.spotlight_size, 1.0);
+    }
+
+    #[test]
+    fn spotlight_state_feeds_fingerprint_and_draw_settings() {
+        let mut app = settings_app();
+        let before = app.settings_fingerprint();
+        app.set_spotlight_size(5.0);
+        assert_ne!(app.settings_fingerprint(), before);
+        app.reset_spotlight_to_center();
+        app.spotlight_location = (1.0, 2.0);
+        assert_ne!(app.settings_fingerprint(), before);
+        app.spotlight_enabled = true;
+        let settings = app.draw_settings().expect("space loaded");
+        assert!(settings.map.spotlight_enabled);
+        assert_eq!(settings.map.spotlight_size, 5.0);
+        assert_eq!(
+            settings.map.spotlight_location,
+            mappalachia_core::model::Coord::new(1.0, 2.0)
+        );
+    }
+
+    // --- Task 5: downloader wiring + Task-4 carry-overs ---
+
+    #[test]
+    fn manual_background_edit_while_spotlight_on_updates_restore() {
+        // Carry-over 1: mirrors the C# `BackgroundImage` setter — a manual
+        // change while spotlight is on becomes the disable-restore value.
+        let dir = spotlight_tmp_root("bgpre");
+        let mut app = settings_app();
+        app.assets_root = Some(dir.to_string_lossy().into_owned());
+        app.background = BackgroundImageType::Military;
+        app.set_spotlight_enabled(true);
+        assert_eq!(app.background, BackgroundImageType::Render);
+        app.dirty = false;
+        app.set_background(BackgroundImageType::Menu);
+        assert_eq!(app.background, BackgroundImageType::Menu);
+        assert!(app.dirty);
+        app.set_spotlight_enabled(false);
+        assert_eq!(
+            app.background,
+            BackgroundImageType::Menu,
+            "disable restores the manually-picked background, not the pre-enable one"
+        );
+        // Unchanged set is a no-op (no spurious invalidate).
+        app.dirty = false;
+        app.set_background(BackgroundImageType::Menu);
+        assert!(!app.dirty);
+        // Spotlight off: the restore value is untouched by manual edits.
+        app.set_background(BackgroundImageType::Military);
+        app.set_spotlight_enabled(true);
+        app.set_spotlight_enabled(false);
+        assert_eq!(app.background, BackgroundImageType::Military);
+        remove_tmp_root(&dir);
+    }
+
+    #[test]
+    fn install_probe_caches_until_invalidated() {
+        // Carry-over 3: the per-frame line reads the cache, which only
+        // refreshes after an explicit invalidation (download Done/cancel/fail).
+        let mut app = settings_app();
+        assert!(!app.spotlight_installed_cached(), "no root: not installed");
+        let dir = spotlight_tmp_root("cache");
+        app.assets_root = Some(dir.to_string_lossy().into_owned());
+        assert!(
+            !app.spotlight_installed_cached(),
+            "stale by design until invalidated"
+        );
+        app.invalidate_spotlight_cache();
+        assert!(app.spotlight_installed_cached());
+        remove_tmp_root(&dir);
+    }
+
+    #[test]
+    fn start_without_assets_root_explains_and_spawns_nothing() {
+        let mut app = settings_app();
+        assert!(app.assets_root.is_none());
+        app.start_spotlight_download();
+        assert!(app.dl_rx.is_none(), "no worker without an asset root");
+        assert_eq!(app.dl_state, DlState::Idle);
+        assert!(
+            app.status.contains("MAPPALACHIA_ASSETS"),
+            "got: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn cancel_resets_state_and_cleans_temp() {
+        let dir = spotlight_tmp_root("cancel");
+        let mut app = settings_app();
+        app.assets_root = Some(dir.to_string_lossy().into_owned());
+        // Fake an in-flight download without a worker (no network): a live
+        // channel with no sender behind it.
+        let (_tx, rx) = std::sync::mpsc::channel::<DlProgress>();
+        app.dl_rx = Some(rx);
+        app.dl_state = DlState::Downloading {
+            file_idx: 1,
+            bytes_done: 5,
+            bytes_total: 10,
+        };
+        let tmp = crate::spotlight_dl::dl_dir(&dir);
+        std::fs::create_dir_all(&tmp).expect("tmp dl dir");
+        std::fs::write(tmp.join(crate::spotlight_dl::SPOTLIGHT_FILE_001), [1u8; 4])
+            .expect("tmp partial");
+        // A partial extract in staging (never the live tree).
+        let staging = crate::spotlight_dl::staging_dir(&dir);
+        std::fs::create_dir_all(staging.join("spotlight/SUB")).expect("tmp staging tree");
+        std::fs::write(staging.join("spotlight/SUB/0.0.jpg"), [1u8; 4])
+            .expect("tmp staged partial");
+        app.cancel_spotlight_download();
+        assert!(app.dl_rx.is_none());
+        assert_eq!(app.dl_state, DlState::Idle);
+        assert!(!tmp.exists(), "temp dir must be cleaned");
+        assert!(!staging.exists(), "staging dir must be cleaned");
+        // Live tree untouched: the fixture install is intact and no staged
+        // partial leaked into it.
+        assert!(
+            !dir.join("img/spotlight/SUB").exists(),
+            "no staged partial in live tree"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("img/spotlight/APPALACHIA/0.0.jpg")).expect("fixture tile"),
+            vec![1u8; 16]
+        );
+        assert!(app.status.contains("cancelled"), "got: {}", app.status);
+        // No-op when idle (status untouched).
+        let status = app.status.clone();
+        app.cancel_spotlight_download();
+        assert_eq!(app.status, status);
+        remove_tmp_root(&dir);
+    }
+
+    #[test]
+    fn download_done_auto_enables_and_flips_background() {
+        // Fresh-install path: spotlight off → on, background Render.
+        let dir = spotlight_tmp_root("done");
+        let mut app = settings_app();
+        app.assets_root = Some(dir.to_string_lossy().into_owned());
+        app.background = BackgroundImageType::Military;
+        app.on_spotlight_download_done();
+        assert_eq!(app.dl_state, DlState::Done);
+        assert!(app.spotlight_enabled);
+        assert_eq!(app.background, BackgroundImageType::Render);
+        assert!(
+            app.status.contains("installed and enabled"),
+            "got: {}",
+            app.status
+        );
+        assert_eq!(app.spotlight_installed_cache, Some(true));
+        remove_tmp_root(&dir);
+    }
+
+    #[test]
+    fn download_done_when_already_enabled_flips_background() {
+        // Enabled pre-install (flag on, background untouched): Done must
+        // still flip to Render — the plain setter would no-op.
+        let dir = spotlight_tmp_root("doneon");
+        let mut app = settings_app();
+        app.set_spotlight_enabled(true);
+        assert!(app.spotlight_enabled);
+        assert_eq!(app.background, BackgroundImageType::Menu);
+        app.assets_root = Some(dir.to_string_lossy().into_owned());
+        app.on_spotlight_download_done();
+        assert!(app.spotlight_enabled);
+        assert_eq!(app.background, BackgroundImageType::Render);
+        assert!(
+            app.status.contains("installed and enabled"),
+            "got: {}",
+            app.status
+        );
+        remove_tmp_root(&dir);
+    }
+
+    #[test]
+    fn dl_fraction_clamps() {
+        assert_eq!(dl_fraction(0, 0), 0.0);
+        assert_eq!(dl_fraction(5, 10), 0.5);
+        assert_eq!(dl_fraction(10, 10), 1.0);
+        assert_eq!(dl_fraction(500, 466), 1.0, "extract overshoot clamps");
+    }
+
+    #[test]
+    fn open_recipe_preserves_background_as_restore_value() {
+        // Carry-over 2 (chosen semantics): the recipe's stored background
+        // becomes the disable-restore baseline.
+        let Some(mut app) = search_app() else {
+            eprintln!("SKIP: MAPPALACHIA_DB unset");
+            return;
+        };
+        app.background = BackgroundImageType::Military;
+        app.spotlight_enabled = true;
+        let path = std::env::temp_dir().join("mappalachia-egui-task5-restore.json");
+        app.save_recipe_to(&path).expect("save succeeds");
+        let mut fresh = App::from_parts(app.db_path.clone(), None, app.spaces.clone());
+        fresh.open_recipe_from(&path).expect("open succeeds");
+        assert!(fresh.spotlight_enabled);
+        assert_eq!(fresh.background, BackgroundImageType::Military);
+        assert_eq!(
+            fresh.background_pre_spotlight,
+            BackgroundImageType::Military
+        );
+        fresh.set_spotlight_enabled(false);
+        assert_eq!(fresh.background, BackgroundImageType::Military);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
