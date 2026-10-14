@@ -141,7 +141,6 @@ pub fn background_rect(space: &Space, spotlight: Option<&SpotView>) -> (f32, f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mappalachia_core::model::Space;
     #[test]
     fn center_maps_to_center() {
         let v = View {

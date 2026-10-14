@@ -14,9 +14,10 @@
 //! # Porting notes
 //! - Standard mode only: [`draw`] returns
 //!   [`DrawError::UnsupportedPlotMode`] for any other [`PlotMode`].
-//! - Spotlight tiles are skipped (see [`draw_spotlight_tiles_stub`]): the
-//!   high-res tile image set is not in scope, and the pipeline always renders
-//!   at full-canvas scale (`transform::View::for_space`).
+//! - Spotlight tiles ([`draw_spotlight_tiles`], `Map.cs:344-401`) draw right
+//!   after the background when `spotlight_enabled` with a `Render`
+//!   background; the pipeline always renders at full-canvas scale
+//!   (`transform::View::for_space`).
 //! - Door and infestation SVGs are scale-1 in C# (`Map.cs:804` default
 //!   `DoorIconScale = 1`; `GetInfestationMarker` passes no scale) while
 //!   [`Assets::svg_marker`](crate::assets::Assets::svg_marker) bakes 1.5x,
@@ -38,7 +39,7 @@ use std::collections::{HashMap, HashSet};
 use mappalachia_core::common::{to_hex_u32, CELL_SIZE, MAP_IMAGE_RESOLUTION};
 use mappalachia_core::db;
 use mappalachia_core::instances;
-use mappalachia_core::model::{Coord, EntityKind, Space};
+use mappalachia_core::model::{Coord, EntityKind, Space, SpotlightTile};
 use mappalachia_core::search::SearchResult;
 use rusqlite::Connection;
 
@@ -55,7 +56,9 @@ use crate::settings::{
     LegendStyle, LegendVerticalAlignment, MapSettings, PlotMode, PlotSettings, VolumeDrawMode,
 };
 use crate::text::{Align, Font};
-use crate::transform::{image_rect_of_world, world_len_to_image, world_to_image, View};
+use crate::transform::{
+    image_rect_of_world, world_len_to_image, world_rect_of_image, world_to_image, View,
+};
 
 const CANVAS: f32 = MAP_IMAGE_RESOLUTION as f32;
 /// `Map.CompassSize = MapImageResolution / 8`.
@@ -309,11 +312,41 @@ fn draws_border(mode: VolumeDrawMode) -> bool {
     matches!(mode, VolumeDrawMode::Border | VolumeDrawMode::Both)
 }
 
-/// Spotlight tiles intentionally skipped: the high-res tile image set is out
-/// of scope, so there is nothing to composite (`Map.Draw` calls
-/// `DrawSpotlightTiles` right after the background; every transform here
-/// uses the full-canvas scale instead).
-fn draw_spotlight_tiles_stub() {}
+/// Port of `Map.DrawSpotlightTiles` (`Map.cs:344-401`): tiles covering the
+/// full-image rect mapped to world coords, each drawn at its own rect.
+/// Missing tiles are skipped (`GetSpotlightTileImage` returns null outside
+/// pre-rendered space). The caller gates on spotlight-enabled + `Render`
+/// background; parallel pre-caching and cancellation/progress reporting
+/// have no equivalent here.
+fn draw_spotlight_tiles(
+    img: &mut tiny_skia::Pixmap,
+    assets: &mut Assets,
+    space: &Space,
+    view: &View,
+) {
+    let (left, top, width, height) = world_rect_of_image(view, 0.0, 0.0, CANVAS, CANVAS);
+    for tile in SpotlightTile::tiles_in_rect(left, top, width, height, space) {
+        let raster = assets
+            .spotlight_tile(
+                tile.space.editor_id(),
+                i64::from(tile.x_id()),
+                i64::from(tile.y_id()),
+            )
+            .map(pixmap_from_image);
+        let Some(raster) = raster else {
+            continue;
+        };
+        let (tx, ty, tw, th) = tile.rectangle();
+        let (ix, iy, iw, ih) = image_rect_of_world(
+            view,
+            f64::from(tx),
+            f64::from(ty),
+            f64::from(tw),
+            f64::from(th),
+        );
+        blit(img, &raster, ix, iy, iw, ih);
+    }
+}
 
 fn settings_background_kind(kind: BackgroundImageType) -> BackgroundKind {
     match kind {
@@ -359,7 +392,11 @@ pub fn draw(input: DrawInput<'_>) -> Result<tiny_skia::Pixmap, DrawError> {
         }
     }
 
-    draw_spotlight_tiles_stub();
+    // `DrawSpotlightTiles` (`Map.cs:134,344-401`): only when spotlight is
+    // enabled AND the background is Render.
+    if map.spotlight_enabled && map.background_image == BackgroundImageType::Render {
+        draw_spotlight_tiles(&mut img, assets, &space, &view);
+    }
 
     // Compass rose (512px canvas, rotated, top-right).
     let compass_useful = map.compass_style == CompassStyle::Always
