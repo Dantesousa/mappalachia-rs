@@ -478,8 +478,9 @@ impl App {
     }
 
     /// Spawn the spotlight download worker: downloads both 7z volumes with
-    /// progress, extracts via [`crate::spotlight_dl`] into `<assets>/img/`,
-    /// and verifies. Progress comes back over an `mpsc` channel folded in
+    /// progress, stage-extracts via [`crate::spotlight_dl`] (verified, then
+    /// promoted into `<assets>/img/spotlight`), and verifies. Progress
+    /// comes back over an `mpsc` channel folded in
     /// by [`App::poll_spotlight_dl`] on the UI thread — the same pattern as
     /// the preview worker, and the `egui::Context` is never touched
     /// off-thread. No-op while a download runs or `assets_root` is unset
@@ -504,9 +505,10 @@ impl App {
     }
 
     /// Cancel an in-flight download: drops the channel (the worker aborts
-    /// on its next send) and best-effort removes the temp dir. No-op when
-    /// idle. Reports via `status`; the install cache is dropped since a
-    /// racing worker may still be cleaning up.
+    /// on its next send) and best-effort removes the temp and staging dirs
+    /// (partial tiles only ever land in staging, never the live tree).
+    /// No-op when idle. Reports via `status`; the install cache is dropped
+    /// since a racing worker may still be cleaning up.
     pub fn cancel_spotlight_download(&mut self) {
         if self.dl_rx.is_none() {
             return;
@@ -515,6 +517,7 @@ impl App {
         self.dl_state = DlState::Idle;
         if let Some(root) = self.assets_root.clone() {
             crate::spotlight_dl::clean_dl_dir(Path::new(&root));
+            crate::spotlight_dl::clean_staging_dir(Path::new(&root));
         }
         self.invalidate_spotlight_cache();
         self.status = "Spotlight download cancelled.".to_string();
@@ -3160,10 +3163,26 @@ mod tests {
         std::fs::create_dir_all(&tmp).expect("tmp dl dir");
         std::fs::write(tmp.join(crate::spotlight_dl::SPOTLIGHT_FILE_001), [1u8; 4])
             .expect("tmp partial");
+        // A partial extract in staging (never the live tree).
+        let staging = crate::spotlight_dl::staging_dir(&dir);
+        std::fs::create_dir_all(staging.join("spotlight/SUB")).expect("tmp staging tree");
+        std::fs::write(staging.join("spotlight/SUB/0.0.jpg"), [1u8; 4])
+            .expect("tmp staged partial");
         app.cancel_spotlight_download();
         assert!(app.dl_rx.is_none());
         assert_eq!(app.dl_state, DlState::Idle);
         assert!(!tmp.exists(), "temp dir must be cleaned");
+        assert!(!staging.exists(), "staging dir must be cleaned");
+        // Live tree untouched: the fixture install is intact and no staged
+        // partial leaked into it.
+        assert!(
+            !dir.join("img/spotlight/SUB").exists(),
+            "no staged partial in live tree"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("img/spotlight/APPALACHIA/0.0.jpg")).expect("fixture tile"),
+            vec![1u8; 16]
+        );
         assert!(app.status.contains("cancelled"), "got: {}", app.status);
         // No-op when idle (status untouched).
         let status = app.status.clone();

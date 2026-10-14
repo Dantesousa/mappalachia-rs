@@ -8,8 +8,12 @@
 //! verifies via the same rule as C# `FileIO.IsSpotlightInstalled`.
 //!
 //! Layout note: the archive payload sits under a top-level `spotlight/`
-//! dir, so extraction goes straight into `<assets>/img/` and lands on the
-//! loader path `<assets>/img/spotlight/...` with no rearranging.
+//! dir. Extraction goes into a staging dir
+//! (`<assets>/img/.spotlight-staging/`) and the verified payload is
+//! renamed into the live loader path `<assets>/img/spotlight/...` only
+//! after verify — never straight into the live tree, so a cancelled or
+//! failed run cannot leave partial tiles behind that would make the
+//! installed-probe misreport `Installed: yes`.
 //!
 //! Threading mirrors the preview worker in `app.rs`: [`run`] does all
 //! blocking work on a worker thread and only [`DlProgress`] crosses over an
@@ -45,9 +49,28 @@ pub const EXPECTED_FILE_COUNT: usize = 466;
 /// Temp downloads live in `<assets>/img/.spotlight-dl/`, cleaned on
 /// success, failure and cancel. No resume (YAGNI) — restart from scratch.
 pub const DL_DIR_NAME: &str = ".spotlight-dl";
+/// Extraction staging dir (`<assets>/img/.spotlight-staging/`): the
+/// archive payload lands here as `<staging>/spotlight/...` and is renamed
+/// into the live `<assets>/img/spotlight/` tree only after verify. Cancel
+/// and failure paths remove the whole staging dir, so partial tiles never
+/// reach the live tree (and a failed re-download never clobbers a good
+/// existing install — the alternative fix, deleting the partial live tree
+/// on failure, would do exactly that, which is why staging was chosen).
+pub const STAGING_DIR_NAME: &str = ".spotlight-staging";
 /// Progress sends at least this often during download (unbounded channel,
 /// so the UI drains instead of queuing per-chunk updates).
 const PROGRESS_EVERY_BYTES: u64 = 262_144;
+/// Connect-phase bound for downloads.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-read bound for downloads (NOT a whole-download timeout): a ~3 GB
+/// download takes minutes of steady progress, and every `read` that keeps
+/// yielding bytes never trips this — but a stalled `read` errors out after
+/// this long, so the worker reports `Failed` instead of lingering, and a
+/// pending cancel (dropped receiver) is noticed on the very next send.
+/// Set explicitly on the blocking client rather than relying on reqwest's
+/// built-in default per-operation timeout, so a future builder change
+/// cannot silently remove the bound.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Download/install lifecycle, owned by the UI thread. The worker reports
 /// [`DlProgress`] and the UI folds each event in via [`DlState::apply`].
@@ -122,6 +145,7 @@ impl DlState {
 
 /// How a blocking step aborted: user-cancelled (receiver gone, stay quiet)
 /// or a real failure (report it when anyone is still listening).
+#[derive(Debug)]
 enum Abort {
     Cancelled,
     Failed(String),
@@ -141,6 +165,28 @@ pub fn dl_dir(assets_root: &Path) -> PathBuf {
 /// Never fails: a missing dir is already clean.
 pub fn clean_dl_dir(assets_root: &Path) {
     let _ = std::fs::remove_dir_all(dl_dir(assets_root));
+}
+
+/// Staging dir for extraction (see [`STAGING_DIR_NAME`]).
+pub fn staging_dir(assets_root: &Path) -> PathBuf {
+    assets_root.join("img").join(STAGING_DIR_NAME)
+}
+
+/// Best-effort staging cleanup (success/failure/cancel paths share it,
+/// alongside [`clean_dl_dir`]). Never fails.
+pub fn clean_staging_dir(assets_root: &Path) {
+    let _ = std::fs::remove_dir_all(staging_dir(assets_root));
+}
+
+/// Shared HTTP client: connect + per-read timeouts, no whole-download
+/// timeout (a ~3 GB download takes minutes). Split out so tests can assert
+/// it builds without touching the network.
+fn build_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(READ_TIMEOUT)
+        .build()
+        .map_err(|e| format!("cannot start download: {e}"))
 }
 
 /// Byte-size gate for a downloaded volume: exact match or `Failed`.
@@ -241,8 +287,8 @@ impl Seek for ChainedReader {
 }
 
 /// Download one volume with throttled progress (pure streaming: a 64 KiB
-/// buf, never the whole 2 GB in memory). No overall timeout — a 2 GB
-/// download takes minutes; only connect is bounded.
+/// buf, never the whole 2 GB in memory). Each `read` is bounded by
+/// [`READ_TIMEOUT`]; there is no whole-download timeout.
 fn download_one(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -262,6 +308,21 @@ fn download_one(
         )));
     }
     let total = resp.content_length().unwrap_or(expected);
+    copy_body(&mut resp, dest, total, file_idx, tx)
+}
+
+/// Stream a response body to `dest` with throttled progress. A read error
+/// — including [`READ_TIMEOUT`] firing on a stalled socket — surfaces as
+/// `Failed` promptly instead of lingering; a dead receiver surfaces as
+/// `Cancelled`. Takes any `Read` so tests can drive it with local fakes
+/// (no network in tests).
+fn copy_body(
+    body: &mut dyn Read,
+    dest: &Path,
+    total: u64,
+    file_idx: usize,
+    tx: &Sender<DlProgress>,
+) -> Result<(), Abort> {
     let mut out = File::create(dest)
         .map_err(|e| Abort::Failed(format!("cannot write {}: {e}", dest.display())))?;
     send(
@@ -275,7 +336,7 @@ fn download_one(
     let mut buf = [0u8; 65536];
     let (mut done, mut last_sent) = (0u64, 0u64);
     loop {
-        let n = resp
+        let n = body
             .read(&mut buf)
             .map_err(|e| Abort::Failed(format!("download {file_idx}/2 failed: {e}")))?;
         if n == 0 {
@@ -307,14 +368,15 @@ fn download_one(
     Ok(())
 }
 
-/// Worker body: download → size-check → extract → clean → verify, then a
-/// terminal `Done`/`Failed`. Runs on a worker thread; only `DlProgress`
-/// crosses threads. Always cleans the temp dir before returning (except a
-/// mid-download cancel leaves cleanup to the shared helper — both run it,
-/// and double-clean is harmless).
+/// Worker body: download → size-check → stage-extract → verify → promote,
+/// then a terminal `Done`/`Failed`. Runs on a worker thread; only
+/// `DlProgress` crosses threads. Always cleans the temp and staging dirs
+/// before returning (a mid-download cancel leaves cleanup to the shared
+/// helpers — both run them, and double-clean is harmless).
 pub fn run(assets_root: &Path, tx: Sender<DlProgress>) {
     let outcome = run_inner(assets_root, &tx);
     clean_dl_dir(assets_root);
+    clean_staging_dir(assets_root);
     match outcome {
         Ok(()) => {
             let _ = tx.send(DlProgress::Done);
@@ -327,14 +389,16 @@ pub fn run(assets_root: &Path, tx: Sender<DlProgress>) {
 }
 
 fn run_inner(assets_root: &Path, tx: &Sender<DlProgress>) -> Result<(), Abort> {
-    let img_dir = assets_root.join("img");
+    let staging = staging_dir(assets_root);
     let dir = dl_dir(assets_root);
     std::fs::create_dir_all(&dir)
         .map_err(|e| Abort::Failed(format!("cannot create {}: {e}", dir.display())))?;
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| Abort::Failed(format!("cannot start download: {e}")))?;
+    // No resume (YAGNI): a stale staging tree from a previous run is
+    // dropped, not continued — extraction restarts from scratch.
+    clean_staging_dir(assets_root);
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| Abort::Failed(format!("cannot create {}: {e}", staging.display())))?;
+    let client = build_client().map_err(Abort::Failed)?;
     let volumes = [
         (SPOTLIGHT_URL_001, SPOTLIGHT_FILE_001, SPOTLIGHT_SIZE_001),
         (SPOTLIGHT_URL_002, SPOTLIGHT_FILE_002, SPOTLIGHT_SIZE_002),
@@ -345,13 +409,24 @@ fn run_inner(assets_root: &Path, tx: &Sender<DlProgress>) -> Result<(), Abort> {
         download_one(&client, url, &dest, *expected, i + 1, tx)?;
         check_size(&dest, *expected).map_err(Abort::Failed)?;
     }
-    send(tx, DlProgress::Verifying).ok();
     extract_volumes(
         &dir.join(SPOTLIGHT_FILE_001),
         &dir.join(SPOTLIGHT_FILE_002),
-        &img_dir,
+        &staging,
         tx,
     )?;
+    send(tx, DlProgress::Verifying).ok();
+    // The staged payload must satisfy the install rule BEFORE it is
+    // allowed near the live tree — a corrupt/empty extract fails here
+    // with the live tree untouched.
+    if !spotlight_tree_has_tiles(&staging.join("spotlight")) {
+        return Err(Abort::Failed(
+            "extraction finished but no spotlight tiles were found; \
+             the archive may be corrupt — try downloading again"
+                .to_string(),
+        ));
+    }
+    promote_staging(assets_root).map_err(Abort::Failed)?;
     if !verify_install(assets_root) {
         return Err(Abort::Failed(
             "extraction finished but no spotlight tiles were found; \
@@ -362,13 +437,73 @@ fn run_inner(assets_root: &Path, tx: &Sender<DlProgress>) -> Result<(), Abort> {
     Ok(())
 }
 
-/// Extract the downloaded pair into `img_dir` (payload top-level
-/// `spotlight/` lands on the loader path). Reports per-file progress;
-/// directory entries are created but not counted.
+/// Same rule as C# `FileIO.IsSpotlightInstalled` (and
+/// [`Assets::is_spotlight_installed`](mappalachia_render::assets::Assets::is_spotlight_installed)),
+/// but rooted at a given `spotlight/` dir instead of an asset root: any
+/// non-0-byte `.jpg` in any subfolder. Used to gate the staged payload
+/// before promotion; pure fs query on fake trees in tests.
+fn spotlight_tree_has_tiles(spotlight_dir: &Path) -> bool {
+    let Ok(subs) = std::fs::read_dir(spotlight_dir) else {
+        return false;
+    };
+    for sub in subs.filter_map(|e| e.ok()) {
+        if !sub.path().is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(sub.path()) else {
+            continue;
+        };
+        for file in files.filter_map(|e| e.ok()) {
+            let is_jpg = file
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"));
+            let is_file = file.file_type().is_ok_and(|t| t.is_file());
+            if is_jpg && is_file && file.metadata().is_ok_and(|m| m.len() > 0) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Rename the verified staged payload (`<staging>/spotlight/`) into the
+/// live loader path (`<assets>/img/spotlight/`). Same parent dir, so same
+/// filesystem and an atomic rename; any previous tree (a good install
+/// being re-downloaded, or leftovers) is removed first. Leaves the staging
+/// dir gone on success; on any error the live tree is either untouched
+/// (payload missing) or holds only the previous tree.
+fn promote_staging(assets_root: &Path) -> Result<(), String> {
+    let staged = staging_dir(assets_root).join("spotlight");
+    if !staged.is_dir() {
+        return Err(format!(
+            "extraction produced no {} payload; the archive may be corrupt — \
+             try downloading again",
+            staged.display()
+        ));
+    }
+    let live = assets_root.join("img").join("spotlight");
+    if live.is_dir() && !live.is_symlink() {
+        std::fs::remove_dir_all(&live)
+            .map_err(|e| format!("cannot replace {}: {e}", live.display()))?;
+    } else if std::fs::symlink_metadata(&live).is_ok() {
+        std::fs::remove_file(&live)
+            .map_err(|e| format!("cannot replace {}: {e}", live.display()))?;
+    }
+    std::fs::rename(&staged, &live)
+        .map_err(|e| format!("cannot install {}: {e}", live.display()))?;
+    clean_staging_dir(assets_root);
+    Ok(())
+}
+
+/// Extract the downloaded pair into `dest_dir` (the archive's top-level
+/// `spotlight/` lands directly under it — pass the staging dir, never the
+/// live `img/` tree). Reports per-file progress; directory entries are
+/// created but not counted.
 fn extract_volumes(
     first: &Path,
     second: &Path,
-    img_dir: &Path,
+    dest_dir: &Path,
     tx: &Sender<DlProgress>,
 ) -> Result<(), Abort> {
     let reader = ChainedReader::open(first, second)
@@ -381,7 +516,7 @@ fn extract_volumes(
         },
     )?;
     let mut done = 0usize;
-    sevenz_rust::decompress_with_extract_fn(reader, img_dir, |entry, reader, dest| {
+    sevenz_rust::decompress_with_extract_fn(reader, dest_dir, |entry, reader, dest| {
         let keep = sevenz_rust::default_entry_extract_fn(entry, reader, dest)
             .map_err(|e| sevenz_rust::Error::other(format!("extract failed: {e}")))?;
         if keep && !entry.is_directory() {
@@ -571,6 +706,231 @@ mod tests {
         // Missing tree entirely: not installed, never panics.
         remove_tmp(&root);
         assert!(!verify_install(&root));
+    }
+
+    #[test]
+    fn client_builds_with_timeouts() {
+        // No network: just proves the shared builder (connect + per-read
+        // timeouts, no whole-download timeout) constructs.
+        assert!(build_client().is_ok());
+    }
+
+    #[test]
+    fn staging_cleanup_is_best_effort() {
+        let root =
+            std::env::temp_dir().join(format!("mappalachia-stageclean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Missing dir: no panic, no error.
+        clean_staging_dir(&root);
+        let dir = staging_dir(&root);
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some(STAGING_DIR_NAME)
+        );
+        std::fs::create_dir_all(dir.join("spotlight/SUB")).expect("tmp staging tree");
+        std::fs::write(dir.join("spotlight/SUB/0.0.jpg"), [1u8; 8]).expect("tmp partial");
+        clean_staging_dir(&root);
+        assert!(!dir.exists(), "staging dir must be gone");
+        // Double-clean is harmless.
+        clean_staging_dir(&root);
+        remove_tmp(&root);
+    }
+
+    #[test]
+    fn staged_tree_gate_matches_install_rule() {
+        let root =
+            std::env::temp_dir().join(format!("mappalachia-stagegate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Missing payload: not installable, never panics.
+        assert!(!spotlight_tree_has_tiles(
+            &staging_dir(&root).join("spotlight")
+        ));
+        let sub = staging_dir(&root).join("spotlight/APPALACHIA");
+        std::fs::create_dir_all(&sub).expect("tmp staged tree");
+        // Empty dir alone does not count.
+        assert!(!spotlight_tree_has_tiles(
+            &staging_dir(&root).join("spotlight")
+        ));
+        // One non-empty tile: installable.
+        std::fs::write(sub.join("0.0.jpg"), [1u8; 16]).expect("tmp staged tile");
+        assert!(spotlight_tree_has_tiles(
+            &staging_dir(&root).join("spotlight")
+        ));
+        // Zero-byte tile does not count (mirrors the C# non-0-byte rule).
+        std::fs::write(sub.join("0.0.jpg"), []).expect("truncate staged tile");
+        assert!(!spotlight_tree_has_tiles(
+            &staging_dir(&root).join("spotlight")
+        ));
+        remove_tmp(&root);
+    }
+
+    #[test]
+    fn promote_swaps_verified_payload_into_place() {
+        let root = std::env::temp_dir().join(format!("mappalachia-promote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // A good previous install being re-downloaded.
+        let live_sub = root.join("img/spotlight/OLD");
+        std::fs::create_dir_all(&live_sub).expect("tmp live tree");
+        std::fs::write(live_sub.join("9.9.jpg"), [7u8; 16]).expect("tmp live tile");
+        // The verified staged payload.
+        let staged_sub = staging_dir(&root).join("spotlight/APPALACHIA");
+        std::fs::create_dir_all(&staged_sub).expect("tmp staged tree");
+        std::fs::write(staged_sub.join("0.0.jpg"), [1u8; 16]).expect("tmp staged tile");
+        promote_staging(&root).expect("promote");
+        // Live tree now holds the new payload, not the old one ...
+        assert!(!live_sub.exists(), "previous tree must be replaced");
+        assert_eq!(
+            std::fs::read(root.join("img/spotlight/APPALACHIA/0.0.jpg")).expect("new tile"),
+            vec![1u8; 16]
+        );
+        // ... the staging dir is gone, and the live probe agrees.
+        assert!(!staging_dir(&root).exists(), "staging dir must be gone");
+        assert!(verify_install(&root));
+        remove_tmp(&root);
+    }
+
+    #[test]
+    fn promote_rejects_missing_payload_and_keeps_live_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "mappalachia-promote-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let live_sub = root.join("img/spotlight/APPALACHIA");
+        std::fs::create_dir_all(&live_sub).expect("tmp live tree");
+        std::fs::write(live_sub.join("0.0.jpg"), [7u8; 16]).expect("tmp live tile");
+        // Empty staging (corrupt/empty extract): promote refuses ...
+        std::fs::create_dir_all(staging_dir(&root)).expect("tmp empty staging");
+        assert!(promote_staging(&root).is_err());
+        // ... and the previous good install is untouched.
+        assert_eq!(
+            std::fs::read(live_sub.join("0.0.jpg")).expect("live tile"),
+            vec![7u8; 16]
+        );
+        assert!(verify_install(&root));
+        remove_tmp(&root);
+    }
+
+    #[test]
+    fn partial_extract_never_touches_live_tree() {
+        // Finding-1 regression: a cancelled/failed mid-extract run leaves
+        // partial tiles ONLY in staging; the live probe cannot misreport.
+        let root = std::env::temp_dir().join(format!(
+            "mappalachia-staging-partial-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("img")).expect("tmp img dir");
+        // Simulate partial extraction output landing in staging.
+        let partial = staging_dir(&root).join("spotlight/APPALACHIA");
+        std::fs::create_dir_all(&partial).expect("tmp partial tree");
+        std::fs::write(partial.join("0.0.jpg"), [1u8; 16]).expect("tmp partial tile");
+        // Live tree has no partials, so the probe still reports missing.
+        assert!(!root.join("img/spotlight").exists());
+        assert!(!verify_install(&root));
+        // Cancel/fail cleanup removes staging; the live tree is untouched.
+        clean_staging_dir(&root);
+        assert!(!staging_dir(&root).exists());
+        assert!(!root.join("img/spotlight").exists());
+        assert!(!verify_install(&root));
+        remove_tmp(&root);
+    }
+
+    /// Fake body: yields `head` bytes once, then fails the way a socket
+    /// read does when the per-read timeout fires on a stalled connection.
+    struct StalledBody {
+        head: Vec<u8>,
+        spent: bool,
+    }
+
+    impl Read for StalledBody {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.spent {
+                self.spent = true;
+                let n = self.head.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.head[..n]);
+                return Ok(n);
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated stalled read",
+            ))
+        }
+    }
+
+    #[test]
+    fn copy_body_streams_with_progress() {
+        let dir = std::env::temp_dir().join(format!("mappalachia-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp copy dir");
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let mut body = std::io::Cursor::new(data.clone());
+        let (tx, rx) = std::sync::mpsc::channel::<DlProgress>();
+        let dest = dir.join("vol.bin");
+        copy_body(&mut body, &dest, data.len() as u64, 1, &tx).expect("stream");
+        assert_eq!(std::fs::read(&dest).expect("written"), data);
+        let events: Vec<DlProgress> = rx.try_iter().collect();
+        assert!(
+            events.len() >= 2,
+            "initial + final sends, got {}",
+            events.len()
+        );
+        assert_eq!(
+            events[0],
+            DlProgress::Downloading {
+                file_idx: 1,
+                bytes_done: 0,
+                bytes_total: data.len() as u64
+            }
+        );
+        assert_eq!(
+            events.last(),
+            Some(&DlProgress::Downloading {
+                file_idx: 1,
+                bytes_done: data.len() as u64,
+                bytes_total: data.len() as u64
+            })
+        );
+        remove_tmp(&dir);
+    }
+
+    #[test]
+    fn copy_body_surfaces_stalled_read_as_failure() {
+        // A stalled socket (read timeout fired) must surface as `Failed`
+        // promptly — never linger, never succeed with a partial file.
+        let dir =
+            std::env::temp_dir().join(format!("mappalachia-copy-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp stall dir");
+        let mut body = StalledBody {
+            head: vec![1u8; 64],
+            spent: false,
+        };
+        let (tx, _rx) = std::sync::mpsc::channel::<DlProgress>();
+        let err = copy_body(&mut body, &dir.join("vol.bin"), 1024, 2, &tx)
+            .expect_err("stalled read must fail");
+        match err {
+            Abort::Failed(message) => assert!(message.contains("failed"), "got: {message}"),
+            Abort::Cancelled => panic!("a live receiver must not read as cancel"),
+        }
+        remove_tmp(&dir);
+    }
+
+    #[test]
+    fn copy_body_cancel_is_quiet() {
+        // Dropped receiver (user cancelled): the first progress send fails
+        // and the copy aborts as `Cancelled`, not `Failed`.
+        let dir =
+            std::env::temp_dir().join(format!("mappalachia-copy-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp cancel dir");
+        let (tx, rx) = std::sync::mpsc::channel::<DlProgress>();
+        drop(rx);
+        let mut body = std::io::Cursor::new(vec![1u8; 64]);
+        let err = copy_body(&mut body, &dir.join("vol.bin"), 64, 1, &tx)
+            .expect_err("dead receiver must abort");
+        assert!(matches!(err, Abort::Cancelled));
+        remove_tmp(&dir);
     }
 
     fn remove_tmp(dir: &Path) {
