@@ -36,7 +36,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use mappalachia_core::common::{to_hex_u32, CELL_SIZE, MAP_IMAGE_RESOLUTION};
+use mappalachia_core::common::{to_hex_u32, CELL_SIZE, MAP_IMAGE_RESOLUTION, SPOTLIGHT_TILE_SIZE};
 use mappalachia_core::db;
 use mappalachia_core::instances;
 use mappalachia_core::model::{Coord, EntityKind, Space, SpotlightTile};
@@ -326,13 +326,16 @@ fn draw_spotlight_tiles(
 ) {
     let (left, top, width, height) = world_rect_of_image(view, 0.0, 0.0, CANVAS, CANVAS);
     for tile in SpotlightTile::tiles_in_rect(left, top, width, height, space) {
+        // Stream one tile at a time (decode → blit → drop): a decoded tile
+        // is ~67MB and a full-canvas render touches hundreds of them, so
+        // the cached lookup would OOM (see `spotlight_tile_uncached`).
         let raster = assets
-            .spotlight_tile(
+            .spotlight_tile_uncached(
                 tile.space.editor_id(),
                 i64::from(tile.x_id()),
                 i64::from(tile.y_id()),
             )
-            .map(pixmap_from_image);
+            .map(|rgba| pixmap_from_image(&rgba));
         let Some(raster) = raster else {
             continue;
         };
@@ -469,6 +472,43 @@ pub fn draw(input: DrawInput<'_>) -> Result<tiny_skia::Pixmap, DrawError> {
 // Compass/grid/infestations/markers
 // ---------------------------------------------------------------------------
 
+/// Port of the `SpotlightEnabled` grid setup (`Map.cs:255-280`):
+/// `viewRange = SpotlightTileSize * size`, `gridSize` snapped to a power
+/// of two against `target_intervals`, bounds from snap factors off the
+/// spotlight location (both sides add `gridSize + (location % gridSize)`,
+/// then `spotlightRange = size * SpotlightTileSize` beyond that).
+/// Returns `(grid_size, min_x, max_x, min_y, max_y)`.
+fn spotlight_grid_bounds(
+    location: (f64, f64),
+    size: f64,
+    target_intervals: f64,
+) -> (f64, f64, f64, f64, f64) {
+    let view_range = f64::from(SPOTLIGHT_TILE_SIZE) * size;
+    let grid_size = 2f64.powf((view_range / target_intervals).log2().round());
+    let spotlight_range = size * f64::from(SPOTLIGHT_TILE_SIZE);
+    let snap_x = grid_size + (location.0 % grid_size);
+    let snap_y = grid_size + (location.1 % grid_size);
+    (
+        grid_size,
+        location.0 - snap_x - spotlight_range,
+        location.0 + snap_x + spotlight_range,
+        location.1 - snap_y - spotlight_range,
+        location.1 + snap_y + spotlight_range,
+    )
+}
+
+/// Port of the `SpotlightEnabled` watermark range/center (`Map.cs:1036-1050`):
+/// `range = (int)size * SpotlightTileSize` (the cast binds tighter than
+/// `*`), center truncates the spotlight location like the C# `(int)` casts.
+/// Returns `(range, center_x, center_y)`.
+fn spotlight_watermark_values(size: f64, location: (f64, f64)) -> (i32, i32, i32) {
+    (
+        (size as i32) * SPOTLIGHT_TILE_SIZE,
+        location.0 as i32,
+        location.1 as i32,
+    )
+}
+
 fn draw_coordinate_grid(
     img: &mut tiny_skia::Pixmap,
     font: &Font,
@@ -476,18 +516,30 @@ fn draw_coordinate_grid(
     space: &Space,
     view: &View,
 ) {
-    // Spotlight branch omitted (spotlight is out of scope).
     let target_intervals = match map.coordinate_grid_precision {
         CoordinateGridPrecision::Fine => 40.0,
         CoordinateGridPrecision::Medium => 20.0,
         CoordinateGridPrecision::Large => 10.0,
     };
-    let view_range = space.max_range;
-    let grid_size = 2f64.powf((view_range / target_intervals).log2().round());
-    let min_x = space.min_x() - (grid_size + (space.min_x() % grid_size));
-    let max_x = space.max_x() + (grid_size - (space.max_x() % grid_size));
-    let min_y = space.min_y() - (grid_size + (space.min_y() % grid_size));
-    let max_y = space.max_y() + (grid_size - (space.max_y() % grid_size));
+    // `Map.cs:255-280`: spotlight anchors the grid to the spotlight
+    // location/size instead of the space rect.
+    let (grid_size, min_x, max_x, min_y, max_y) = if map.spotlight_enabled {
+        spotlight_grid_bounds(
+            (map.spotlight_location.x, map.spotlight_location.y),
+            map.spotlight_size,
+            target_intervals,
+        )
+    } else {
+        let view_range = space.max_range;
+        let grid_size = 2f64.powf((view_range / target_intervals).log2().round());
+        (
+            grid_size,
+            space.min_x() - (grid_size + (space.min_x() % grid_size)),
+            space.max_x() + (grid_size - (space.max_x() % grid_size)),
+            space.min_y() - (grid_size + (space.min_y() % grid_size)),
+            space.max_y() + (grid_size - (space.max_y() % grid_size)),
+        )
+    };
 
     let px = (map.font_settings.size_coordinate_grid) as f32;
 
@@ -953,10 +1005,21 @@ fn draw_watermark(
         text.push_str(" (Instanced)");
     }
     if map.show_coordinate_grid {
-        text = format!(
-            "Range: {}\nCenter: {}, {}\n{text}",
-            space.max_range as i32, space.center_x as i32, space.center_y as i32
-        );
+        // `Map.cs:1036-1050`: spotlight reports the tile range and the
+        // truncated spotlight location instead of the space range/center.
+        let (range, center_x, center_y) = if map.spotlight_enabled {
+            spotlight_watermark_values(
+                map.spotlight_size,
+                (map.spotlight_location.x, map.spotlight_location.y),
+            )
+        } else {
+            (
+                space.max_range as i32,
+                space.center_x as i32,
+                space.center_y as i32,
+            )
+        };
+        text = format!("Range: {range}\nCenter: {center_x}, {center_y}\n{text}");
     }
     text.push_str(&format!(
         "\nGame Version {} | Made with Mappalachia: github.com/AHeroicLlama/Mappalachia",
@@ -1129,4 +1192,38 @@ fn draw_legend(
     }
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{spotlight_grid_bounds, spotlight_watermark_values};
+
+    #[test]
+    fn spotlight_grid_bounds_match_csharp_math() {
+        // Hand-computed from `Map.cs:255-280`: size 2, Medium precision (20
+        // target intervals): viewRange = 4096 * 2 = 8192,
+        // gridSize = 2^round(log2(8192 / 20)) = 2^9 = 512,
+        // snapX = 512 + (-500 % 512) = 12,
+        // snapY = 512 + (135 % 512) = 647, range = 2 * 4096 = 8192.
+        let (grid, min_x, max_x, min_y, max_y) = spotlight_grid_bounds((-500.0, 135.0), 2.0, 20.0);
+        assert_eq!(grid, 512.0);
+        assert_eq!((min_x, max_x), (-8704.0, 7704.0));
+        assert_eq!((min_y, max_y), (-8704.0, 8974.0));
+    }
+
+    #[test]
+    fn spotlight_watermark_truncates_like_csharp_casts() {
+        // `Map.cs:1038-1041`: `range = (int)size * SpotlightTileSize` (the
+        // cast binds tighter than `*`), center truncates the location.
+        assert_eq!(
+            spotlight_watermark_values(2.0, (-500.9, 135.9)),
+            (8192, -500, 135)
+        );
+        // A fractional size truncates BEFORE the multiply: (int)2.9 * 4096.
+        assert_eq!(spotlight_watermark_values(2.9, (0.0, 0.0)), (8192, 0, 0));
+    }
 }

@@ -266,6 +266,24 @@ impl Assets {
         self.load_cached(&path)
     }
 
+    /// Same tile lookup as [`Assets::spotlight_tile`] but WITHOUT caching:
+    /// decode, return owned, caller drops right after blitting. A decoded
+    /// 4096² tile is ~67MB and a full-canvas Appalachia render touches ~460
+    /// of them — retaining all of them (C#'s static
+    /// `SpotlightTileImageCache` survives on a Windows pagefile) OOMs this
+    /// host, so the render loop streams through this instead. Output pixels
+    /// are identical; only peak RSS changes.
+    pub fn spotlight_tile_uncached(
+        &self,
+        space_editor: &str,
+        x_id: i64,
+        y_id: i64,
+    ) -> Option<image::RgbaImage> {
+        let rel = format!("img/spotlight/{space_editor}/{x_id}.{y_id}.jpg");
+        let path = self.resolve(&rel)?;
+        image::open(path).ok().map(|img| img.to_rgba8())
+    }
+
     /// Mirrors `IsSpotlightInstalled` (`FileIO.cs:70-100`): any non-0-byte
     /// jpg in any `img/spotlight` subfolder.
     pub fn is_spotlight_installed(&self) -> bool {
