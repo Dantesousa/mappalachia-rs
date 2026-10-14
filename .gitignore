@@ -1,2 +1,7 @@
 /target/
 docs/
+data/
+img/
+font/
+mappalachia-cli-linux-x86_64
+mappalachia-rs-x86_64.AppImage
