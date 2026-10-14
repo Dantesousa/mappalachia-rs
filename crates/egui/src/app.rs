@@ -1057,6 +1057,112 @@ pub fn recommend_jpeg(space: &Space, background: BackgroundImageType) -> bool {
     space.is_worldspace && background != BackgroundImageType::None
 }
 
+/// Zoom range shared by both preview `Scene`s (main window + map window).
+fn preview_zoom_range() -> egui::Rangef {
+    egui::Rangef::new(0.0, 8.0)
+}
+
+/// Preview `Scene` input mapping (verified against the vendored egui 0.32.3
+/// source, `containers/scene.rs`):
+///
+/// * Plain drag pans: `Scene::register_pan_and_zoom` pans on `dragged_by`
+///   for every button in `drag_pan_buttons` (default `all()`), with no
+///   modifier keys involved (`to_global.translation += scaling * drag_delta`).
+/// * Plain wheel zooms centered on the cursor: `Scene` has NO flag for this.
+///   Its default routes unmodified wheel events into `smooth_scroll_delta`,
+///   which `register_pan_and_zoom` applies as a pan, while Ctrl/Cmd+wheel
+///   (the `InputOptions::zoom_modifier`, default CTRL/CMD) feeds
+///   `zoom_delta`, the native cursor-anchored zoom. So [`apply_wheel_zoom`]
+///   converts the pending wheel delta into a zoom of `scene_rect` around
+///   the pointer and consumes `smooth_scroll_delta` (the sanctioned pattern:
+///   `ScrollArea` consumes the same field) before `Scene::show` runs,
+///   leaving `Scene` nothing to pan with.
+/// * Ctrl/Cmd+wheel and pinch still zoom via `Scene`'s native `zoom_delta`
+///   path. Those events never reach `smooth_scroll_delta`, so the pre-pass
+///   no-ops and cannot double-zoom.
+///
+/// Hence the hint text `Drag to pan, scroll to zoom.` is accurate, and both
+/// preview `Scene`s share this pre-pass plus [`preview_zoom_range`].
+fn apply_wheel_zoom(ui: &mut egui::Ui, scene_rect: &mut egui::Rect, zoom_range: egui::Rangef) {
+    // Fit-to-panel sentinel (`Rect::ZERO`): `Scene` auto-fits, nothing to zoom.
+    if !scene_rect.is_finite() || scene_rect.size() == egui::Vec2::ZERO {
+        return;
+    }
+    let Some(pointer) = ui.input(|i| i.pointer.latest_pos()) else {
+        return;
+    };
+    // Viewport `Scene::show` is about to allocate this frame (same size it
+    // passes to `allocate_exact_size`, placed at the next widget position).
+    let viewport =
+        egui::Rect::from_min_size(ui.next_widget_position(), ui.available_size_before_wrap());
+    if !viewport.contains(pointer) {
+        // Pointer is elsewhere (e.g. over the items list): leave the scroll
+        // for that widget's own `ScrollArea`.
+        return;
+    }
+    let delta = ui.input(|i| i.smooth_scroll_delta);
+    if delta == egui::Vec2::ZERO {
+        return;
+    }
+    let factor = wheel_zoom_factor(delta.x + delta.y);
+    if factor == 1.0 {
+        return;
+    }
+    // Pointer in scene coordinates under `Scene`'s centered fit transform
+    // (`fit_to_rect_in_scene`): uniform scale, centers coincident.
+    let scale = (viewport.size() / scene_rect.size()).min_elem();
+    if !scale.is_finite() || scale <= 0.0 {
+        return;
+    }
+    let anchor = (scene_rect.center().to_vec2() + (pointer - viewport.center()) / scale).to_pos2();
+    *scene_rect = zoom_rect_around_anchor(*scene_rect, anchor, factor, viewport.size(), zoom_range);
+    ui.ctx()
+        .input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+}
+
+/// Wheel scroll (in egui points, axes summed like egui's own scroll-to-zoom:
+/// `InputOptions::scroll_zoom_speed * (dx + dy)`) mapped to a zoom factor.
+/// Uses egui 0.32's default `scroll_zoom_speed` (`1/200`), so plain-wheel
+/// matches the native Ctrl+wheel feel and direction (wheel-forward zooms in)
+/// by construction. Pure state math — unit-tested, no event loop.
+fn wheel_zoom_factor(scroll_points: f32) -> f32 {
+    (scroll_points / 200.0).exp()
+}
+
+/// Zoom a `Scene` view rect around `anchor` (scene coordinates) by `factor`
+/// (>1 zooms in: the rect shrinks around the anchor, which stays fixed on
+/// screen under `Scene`'s centered fit transform). `outer_size` is the
+/// viewport size, so the resulting fit-scale (`outer / rect`, min axis) is
+/// clamped into `zoom_range`, mirroring `Scene`'s own clamping.
+/// Degenerate inputs (invalid/empty rect, non-positive or non-finite factor)
+/// return the rect unchanged. Pure state math — unit-tested, no event loop.
+fn zoom_rect_around_anchor(
+    scene_rect: egui::Rect,
+    anchor: egui::Pos2,
+    factor: f32,
+    outer_size: egui::Vec2,
+    zoom_range: egui::Rangef,
+) -> egui::Rect {
+    if !scene_rect.is_finite() || scene_rect.size() == egui::Vec2::ZERO {
+        return scene_rect;
+    }
+    if !factor.is_finite() || factor <= 0.0 || factor == 1.0 {
+        return scene_rect;
+    }
+    let scale = (outer_size / scene_rect.size()).min_elem();
+    if !scale.is_finite() || scale <= 0.0 {
+        return scene_rect;
+    }
+    let applied = zoom_range.clamp(scale * factor) / scale;
+    if applied == 1.0 {
+        return scene_rect;
+    }
+    let anchor = anchor.to_vec2();
+    let min = (anchor + (scene_rect.min.to_vec2() - anchor) / applied).to_pos2();
+    let max = (anchor + (scene_rect.max.to_vec2() - anchor) / applied).to_pos2();
+    egui::Rect::from_min_max(min, max)
+}
+
 /// Convert an items-to-plot entry back to recipe `SearchResult`s, stamping
 /// the assigned group + legend text onto every variant (one entry per
 /// variant, so reopening loses no instances; each reopens as its own
@@ -1579,8 +1685,13 @@ impl eframe::App for App {
                         }
                     });
                     let native = tex.size_vec2();
+                    // Plain-wheel zoom pre-pass (see `apply_wheel_zoom` docs
+                    // for the input mapping): turns pending scroll into a
+                    // cursor-anchored zoom before `Scene` can pan with it.
+                    // Plain drag pans via `Scene`'s default, no modifiers.
+                    apply_wheel_zoom(ui, &mut self.scene_rect, preview_zoom_range());
                     egui::Scene::new()
-                        .zoom_range(egui::Rangef::new(0.0, 8.0))
+                        .zoom_range(preview_zoom_range())
                         .max_inner_size(native + egui::Vec2::splat(32.0))
                         .show(ui, &mut self.scene_rect, |ui| {
                             ui.add(egui::Image::new(tex).fit_to_exact_size(native));
@@ -1670,8 +1781,10 @@ impl App {
             });
             let native = self.map_window_tex.as_ref().expect("checked").size_vec2();
             let tex = self.map_window_tex.as_ref().expect("checked");
+            // Same plain-wheel-zoom pre-pass as the main preview (own rect).
+            apply_wheel_zoom(ui, &mut self.map_scene_rect, preview_zoom_range());
             egui::Scene::new()
-                .zoom_range(egui::Rangef::new(0.0, 8.0))
+                .zoom_range(preview_zoom_range())
                 .max_inner_size(native + egui::Vec2::splat(32.0))
                 .show(ui, &mut self.map_scene_rect, |ui| {
                     ui.add(egui::Image::new(tex).fit_to_exact_size(native));
@@ -1910,6 +2023,85 @@ mod tests {
         // The preview Scene starts fit-to-panel (`Rect::ZERO` auto-fits);
         // the Reset-view button restores exactly this value.
         assert_eq!(app.scene_rect, egui::Rect::ZERO);
+    }
+
+    /// Polish: plain-wheel zoom math (state-level, no event loop). The
+    /// `apply_wheel_zoom` handler itself needs a live `Ui`, so only the
+    /// pure factor/rect math is unit-tested here.
+    #[test]
+    fn wheel_zoom_factor_identity_and_direction() {
+        assert_eq!(wheel_zoom_factor(0.0), 1.0);
+        let notch = wheel_zoom_factor(50.0);
+        assert!(notch > 1.0, "wheel-forward must zoom in, got {notch}");
+        let back = wheel_zoom_factor(-50.0);
+        assert!(back < 1.0, "wheel-back must zoom out, got {back}");
+        assert!(
+            (notch * back - 1.0).abs() < 1e-6,
+            "symmetric scroll must invert exactly"
+        );
+    }
+
+    /// Polish: zooming around an anchor keeps that anchor projected at the
+    /// same screen point (cursor-anchored zoom) and scales the rect area by
+    /// `factor^2`. Geometry: 800x600 viewport showing a 1600x1200 scene
+    /// rect (fit scale 0.5), 2x zoom around an off-center anchor.
+    #[test]
+    fn zoom_rect_around_anchor_keeps_anchor_on_screen() {
+        let outer = egui::vec2(800.0, 600.0);
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1600.0, 1200.0));
+        let anchor = egui::pos2(400.0, 300.0);
+        let zoomed = zoom_rect_around_anchor(rect, anchor, 2.0, outer, preview_zoom_range());
+        assert!((zoomed.width() - 800.0).abs() < 1e-4);
+        assert!((zoomed.height() - 600.0).abs() < 1e-4);
+        // Screen projection under the centered fit transform `Scene` uses:
+        // screen = outer.center + (scene - rect.center) * fit-scale.
+        let screen_of = |r: egui::Rect, p: egui::Pos2| {
+            let scale = (outer / r.size()).min_elem();
+            egui::pos2(400.0, 300.0) + (p - r.center()) * scale
+        };
+        let drift = screen_of(zoomed, anchor) - screen_of(rect, anchor);
+        assert!(
+            drift.length() < 1e-3,
+            "anchor must stay under the cursor, drifted by {drift:?}"
+        );
+    }
+
+    /// Polish: the zoom clamps to the range exactly like `Scene` does
+    /// (fit-scale `outer / rect` stays inside `zoom_range`).
+    #[test]
+    fn zoom_rect_clamps_to_zoom_range() {
+        let outer = egui::vec2(800.0, 600.0);
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1600.0, 1200.0));
+        let anchor = egui::pos2(800.0, 600.0);
+        let range = egui::Rangef::new(0.1, 2.0);
+        // Current fit scale is 0.5; a 100x zoom must stop at scale 2.0.
+        let zoomed = zoom_rect_around_anchor(rect, anchor, 100.0, outer, range);
+        let scale = (outer / zoomed.size()).min_elem();
+        assert!((scale - 2.0).abs() < 1e-4, "must clamp to max, got {scale}");
+        // A 1/100x zoom-out must stop at scale 0.1.
+        let zoomed = zoom_rect_around_anchor(rect, anchor, 0.01, outer, range);
+        let scale = (outer / zoomed.size()).min_elem();
+        assert!((scale - 0.1).abs() < 1e-4, "must clamp to min, got {scale}");
+    }
+
+    /// Polish: degenerate inputs leave the rect untouched (the fit-to-panel
+    /// `Rect::ZERO` sentinel, identity/invalid factors).
+    #[test]
+    fn zoom_rect_ignores_degenerate_inputs() {
+        let outer = egui::vec2(800.0, 600.0);
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1600.0, 1200.0));
+        let anchor = egui::pos2(800.0, 600.0);
+        assert_eq!(
+            zoom_rect_around_anchor(egui::Rect::ZERO, anchor, 2.0, outer, preview_zoom_range()),
+            egui::Rect::ZERO
+        );
+        for factor in [1.0, 0.0, -2.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                zoom_rect_around_anchor(rect, anchor, factor, outer, preview_zoom_range()),
+                rect,
+                "factor {factor}"
+            );
+        }
     }
 
     #[test]
